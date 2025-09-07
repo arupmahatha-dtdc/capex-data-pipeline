@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from process_capex import process_capex_from_dataframe
+from process_capex import process_capex_from_dataframe, validate_processed_data
 import io
 import base64
 import os
@@ -120,6 +120,21 @@ def main():
     # Process button
     process_button = st.sidebar.button("🚀 Process Data", type="primary")
     
+    # Validation section
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## 🔍 Data Validation")
+    
+    # Reference data uploader
+    reference_data_file = st.sidebar.file_uploader(
+        "Upload Reference Data (CSV)",
+        type=['csv'],
+        help="Upload reference data (e.g., final_data.csv) to validate against processed output",
+        key="reference_uploader"
+    )
+    
+    # Validate button
+    validate_button = st.sidebar.button("🔍 Validate Data", type="secondary")
+    
     # Initialize session state
     if 'processed_data' not in st.session_state:
         st.session_state.processed_data = None
@@ -137,6 +152,10 @@ def main():
         st.session_state.rental_items = None
     if 'processing_log' not in st.session_state:
         st.session_state.processing_log = []
+    if 'validation_results' not in st.session_state:
+        st.session_state.validation_results = None
+    if 'reference_data' not in st.session_state:
+        st.session_state.reference_data = None
     
     # Process data when button is clicked
     if process_button:
@@ -156,20 +175,15 @@ def main():
                 
                 # Process the data
                 with st.spinner("Processing data... This may take a few moments."):
-                    processed_data, pivot_data = process_capex_from_dataframe(
+                    processed_data, pivot_data, amc_items, sorter_items, rental_items = process_capex_from_dataframe(
                         raw_data
                     )
                 
                 st.session_state.processed_data = processed_data
                 st.session_state.pivot_data = pivot_data
-                
-                # Load additional files if they exist
-                if os.path.exists('amc_items.csv'):
-                    st.session_state.amc_items = pd.read_csv('amc_items.csv')
-                if os.path.exists('sorter_items.csv'):
-                    st.session_state.sorter_items = pd.read_csv('sorter_items.csv')
-                if os.path.exists('rental_opex_items.csv'):
-                    st.session_state.rental_items = pd.read_csv('rental_opex_items.csv')
+                st.session_state.amc_items = amc_items if len(amc_items) > 0 else None
+                st.session_state.sorter_items = sorter_items if len(sorter_items) > 0 else None
+                st.session_state.rental_items = rental_items if len(rental_items) > 0 else None
                 
                 # Add to processing log
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -188,16 +202,43 @@ def main():
         else:
             st.error("❌ Please upload a raw data file first.")
     
+    # Validation logic
+    if validate_button:
+        if st.session_state.processed_data is not None and reference_data_file is not None:
+            try:
+                # Load reference data
+                reference_data = pd.read_csv(reference_data_file)
+                st.session_state.reference_data = reference_data
+                
+                # Run validation
+                with st.spinner("Validating data... This may take a few moments."):
+                    validation_results = validate_processed_data(
+                        st.session_state.processed_data, 
+                        reference_data
+                    )
+                
+                st.session_state.validation_results = validation_results
+                st.success("✅ Data validation completed!")
+                
+            except Exception as e:
+                st.error(f"❌ Error during validation: {str(e)}")
+                st.exception(e)
+        elif st.session_state.processed_data is None:
+            st.error("❌ Please process data first before validation.")
+        elif reference_data_file is None:
+            st.error("❌ Please upload reference data file for validation.")
+    
     # Main content area - Show only generated sheets
     if st.session_state.processed_data is not None:
         st.markdown('<h2 class="section-header">📤 Generated Sheets & Analysis</h2>', unsafe_allow_html=True)
         
         # Main output tabs
-        output_tab1, output_tab2, output_tab3, output_tab4, output_tab5 = st.tabs([
+        output_tab1, output_tab2, output_tab3, output_tab4, output_tab5, output_tab6 = st.tabs([
             "📊 Processed Data", 
             "📈 Pivot Table", 
             "🔧 Specialized Items",
             "📊 Analytics & Charts",
+            "🔍 Data Validation",
             "📋 Processing Log"
         ])
         
@@ -351,6 +392,118 @@ def main():
             st.dataframe(function_summary, use_container_width=True)
             
         with output_tab5:
+            st.markdown("### Data Validation Results")
+            
+            if st.session_state.validation_results is not None:
+                validation_results = st.session_state.validation_results
+                
+                # Validation summary
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    status_color = "🟢" if validation_results['summary']['validation_status'] == 'PASS' else "🔴"
+                    st.metric("Validation Status", f"{status_color} {validation_results['summary']['validation_status']}")
+                
+                with col2:
+                    st.metric("Overall Accuracy", f"{validation_results['summary']['overall_accuracy']}%")
+                
+                with col3:
+                    st.metric("Matched RequestNos", validation_results['matched_records'])
+                
+                with col4:
+                    st.metric("Total Mismatches", validation_results['summary']['total_mismatches'])
+                
+                # RequestNo matching metrics
+                st.markdown("#### RequestNo Matching Metrics")
+                accuracy_metrics = validation_results['accuracy_metrics']
+                
+                match_col1, match_col2, match_col3, match_col4 = st.columns(4)
+                
+                with match_col1:
+                    if 'match_accuracy' in accuracy_metrics:
+                        st.metric("Match Accuracy", f"{accuracy_metrics['match_accuracy']}%")
+                
+                with match_col2:
+                    if 'matched_count' in accuracy_metrics:
+                        st.metric("Matched Count", accuracy_metrics['matched_count'])
+                
+                with match_col3:
+                    if 'only_in_processed_count' in accuracy_metrics:
+                        st.metric("Only in Processed", accuracy_metrics['only_in_processed_count'])
+                
+                with match_col4:
+                    if 'only_in_reference_count' in accuracy_metrics:
+                        st.metric("Only in Reference", accuracy_metrics['only_in_reference_count'])
+                
+                # Field comparison metrics (for matched records)
+                if validation_results['matched_records'] > 0:
+                    st.markdown("#### Field Comparison (Matched Records Only)")
+                    field_col1, field_col2, field_col3 = st.columns(3)
+                    
+                    with field_col1:
+                        if 'amount_accuracy' in accuracy_metrics:
+                            st.metric("Amount Accuracy", f"{accuracy_metrics['amount_accuracy']}%")
+                    
+                    with field_col2:
+                        if 'zone_accuracy' in accuracy_metrics:
+                            st.metric("Zone Accuracy", f"{accuracy_metrics['zone_accuracy']}%")
+                    
+                    with field_col3:
+                        if 'category_accuracy' in accuracy_metrics:
+                            st.metric("Category Accuracy", f"{accuracy_metrics['category_accuracy']}%")
+                
+                # Mismatches
+                if validation_results['mismatches']:
+                    st.markdown("#### Mismatches Found")
+                    
+                    for i, mismatch in enumerate(validation_results['mismatches']):
+                        with st.expander(f"Mismatch {i+1}: {mismatch['type']}"):
+                            if mismatch['type'] == 'Only in Processed Data':
+                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
+                                st.write(f"**Description:** {mismatch['description']}")
+                            
+                            elif mismatch['type'] == 'Only in Reference Data':
+                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
+                                st.write(f"**Description:** {mismatch['description']}")
+                            
+                            elif mismatch['type'] == 'Amount Mismatch':
+                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
+                                st.write(f"**Processed Amount:** ₹{mismatch['processed_amount']:,.2f}")
+                                st.write(f"**Reference Amount:** ₹{mismatch['reference_amount']:,.2f}")
+                                st.write(f"**Difference:** ₹{mismatch['difference']:,.2f}")
+                            
+                            elif mismatch['type'] == 'Zone Mismatch':
+                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
+                                st.write(f"**Processed Zones:** {mismatch['processed_zones']}")
+                                st.write(f"**Reference Zones:** {mismatch['reference_zones']}")
+                            
+                            elif mismatch['type'] == 'Category Mismatch':
+                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
+                                st.write(f"**Processed Categories:** {mismatch['processed_categories']}")
+                                st.write(f"**Reference Categories:** {mismatch['reference_categories']}")
+                else:
+                    st.success("🎉 No mismatches found! Data validation passed completely.")
+                
+                # Download validation report
+                st.markdown("#### Download Validation Report")
+                validation_df = pd.DataFrame(validation_results['mismatches'])
+                if not validation_df.empty:
+                    st.markdown(create_download_link(
+                        validation_df, 
+                        "validation_report.csv", 
+                        "📥 Download Validation Report"
+                    ), unsafe_allow_html=True)
+                else:
+                    st.info("No mismatches to download.")
+                
+            else:
+                st.info("No validation results available. Please upload reference data and run validation.")
+                
+                if st.session_state.reference_data is not None:
+                    st.markdown("#### Reference Data Summary")
+                    display_dataframe_summary(st.session_state.reference_data, "Reference Data")
+            
+        with output_tab6:
             st.markdown("### Processing Log")
             
             if st.session_state.processing_log:
@@ -377,6 +530,7 @@ def main():
                 <li>Upload your raw Capex data file (CSV format)</li>
                 <li>Click the "Process Data" button</li>
                 <li>View and download all generated sheets and analysis</li>
+                <li><strong>Optional:</strong> Upload reference data (e.g., final_data.csv) to validate output accuracy</li>
             </ol>
             <p><strong>Note:</strong> Office locations are automatically loaded from the fixed 'office_location.csv' file.</p>
         </div>
@@ -410,6 +564,7 @@ def main():
             **📈 Analytics & Reports**
             - Interactive Charts
             - Summary Statistics
+            - Data Validation
             - Processing Log
             - Download Options
             """)
@@ -420,7 +575,8 @@ def main():
         1. **Upload Raw Data**: Use the sidebar to upload your raw Capex data CSV file
         2. **Process Data**: Click the "Process Data" button to run the pipeline
         3. **View Results**: Navigate through the tabs to see all generated sheets
-        4. **Download**: Use the download links to save any sheet you need
+        4. **Validate Data** (Optional): Upload reference data (e.g., final_data.csv) and click "Validate Data" to check accuracy
+        5. **Download**: Use the download links to save any sheet you need
         
         **Note:** Office locations are automatically loaded from the fixed 'office_location.csv' file in the project directory.
         """)
