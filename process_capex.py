@@ -11,7 +11,7 @@ def load_office_locations():
     return office_locations
 
 def add_zone_region_mapping(df, office_locations):
-    """Add Zone and Region columns by mapping branch codes"""
+    """Add Zone and Region columns by mapping branch codes with fallback to UserRemarks"""
     print("Adding Zone and Region mapping...")
     
     # Create a mapping from branch code to zone/region
@@ -36,6 +36,36 @@ def add_zone_region_mapping(df, office_locations):
         print(f"Found {unmapped_mask.sum()} unmapped branch codes")
         unmapped_codes = df[unmapped_mask]['BranchCode'].unique()
         print(f"Unmapped codes: {unmapped_codes[:10]}...")
+        
+        # Fallback logic: Check UserRemarks for region codes when BranchCode mapping fails
+        print("Applying fallback mapping from UserRemarks...")
+        
+        # Create a mapping from region code to zone/region
+        regioncode_to_zone = {}
+        regioncode_to_region = {}
+        
+        for _, row in office_locations.iterrows():
+            region_code = row['regioncode']
+            zone = row['zone']
+            region = row['region']
+            regioncode_to_zone[region_code] = zone
+            regioncode_to_region[region_code] = region
+        
+        # Apply fallback mapping for unmapped rows
+        fallback_mapped_count = 0
+        for idx in df[unmapped_mask].index:
+            user_remarks = str(df.loc[idx, 'UserRemarks']).upper()
+            
+            # Check if any region code is contained in UserRemarks
+            for region_code, zone in regioncode_to_zone.items():
+                if region_code in user_remarks:
+                    df.loc[idx, 'Zone'] = zone
+                    df.loc[idx, 'Region'] = regioncode_to_region[region_code]
+                    fallback_mapped_count += 1
+                    print(f"Fallback mapped: BranchCode {df.loc[idx, 'BranchCode']} -> {region_code} -> Zone: {zone}, Region: {regioncode_to_region[region_code]}")
+                    break
+        
+        print(f"Fallback mapping applied to {fallback_mapped_count} records")
     
     # Fill remaining missing values with 'Unknown'
     df['Zone'] = df['Zone'].fillna('Unknown')
@@ -46,63 +76,43 @@ def add_zone_region_mapping(df, office_locations):
     return df
 
 def remove_rejected_capex(df):
-    """Remove rows with 'Rejected' Capex status"""
+    """Remove rows with 'Rejected' Capex status (case-insensitive)"""
     print("Removing rejected Capex requests...")
     initial_count = len(df)
-    df = df[df['CurrentStatus'] != 'Rejected']
+    status_series = df['CurrentStatus'].astype(str).str.strip().str.casefold()
+    df = df[status_series != 'rejected']
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rejected requests. Remaining: {len(df)} rows")
     return df
 
-def filter_asset_categories(df):
-    """Keep only COMPUTER, PLANT & MACHINERY, LEASEHOLD IMPROVEMENTS, FURNITURE, OFFICE EQUIPMENTS in AssetCategoryName"""
-    print("Filtering asset categories...")
+def filter_asset_categories_keep_three(df):
+    """Keep only COMPUTER, PLANT & MACHINERY, LEASEHOLD in normalized AssetCategoryName_2 (case-insensitive)."""
+    print("Filtering asset categories to only three allowed values...")
     initial_count = len(df)
-    
-    # Define allowed asset categories (based on final_data.csv analysis)
-    allowed_categories = ['COMPUTER', 'PLANT & MACHINERY', 'LEASEHOLD IMPROVEMENTS', 'FURINTURE', 'OFFICE EQUIPMENTS']
-    
-    # Filter the dataframe
-    df = df[df['AssetCategoryName'].isin(allowed_categories)]
-    
+    allowed = {'computer', 'plant & machinery', 'leasehold'}
+    mask_allowed = df['AssetCategoryName_2'].astype(str).str.strip().str.casefold().isin(allowed)
+    df = df[mask_allowed]
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows with non-allowed asset categories. Remaining: {len(df)} rows")
     return df
 
 def remove_unwanted_request_functions(df):
-    """Remove CS, FA, Sales, Channel, Vigilance from RequestFunction after checking user remarks"""
+    """Remove CS, FA, Sales, Channel, Vigilance from RequestFunction (case-insensitive)."""
     print("Removing unwanted request functions...")
     initial_count = len(df)
-    
-    # Define functions to remove (including vigilance with lowercase)
-    functions_to_remove = ['CS', 'FA', 'Sales', 'Channel', 'Vigilance', 'vigilance']
-    
-    # Remove rows with these functions
-    df = df[~df['RequestFunction'].isin(functions_to_remove)]
-    
+    rf = df['RequestFunction'].astype(str).str.strip().str.casefold()
+    to_remove = {s.lower(): None for s in ['CS', 'FA', 'Sales', 'Channel', 'Vigilance']}
+    df = df[~rf.isin(set(to_remove.keys()))]
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows with unwanted request functions. Remaining: {len(df)} rows")
     return df
 
 def remove_dash_vendors(df):
-    """Remove rows with '-' in IsSelectedVendor column, but keep some based on final_data analysis"""
-    print("Filtering rows with '-' in IsSelectedVendor...")
+    """Remove rows with '-' in IsSelectedVendor column (strict removal)."""
+    print("Removing rows with '-' in IsSelectedVendor...")
     initial_count = len(df)
-    
-    # Get rows with '-' in IsSelectedVendor
-    dash_rows = df[df['IsSelectedVendor'] == '-'].copy()
-    non_dash_rows = df[df['IsSelectedVendor'] != '-'].copy()
-    
-    # Based on final_data analysis, some rows with '-' are kept
-    # Keep rows with '-' if they have 'Sent for Approval' status and specific conditions
-    keep_dash_rows = dash_rows[
-        (dash_rows['CurrentStatus'] == 'Sent for Approval') &
-        (dash_rows['RequestFunction'].isin(['Admin', 'Ops', 'Ops through IT', 'IT']))
-    ]
-    
-    # Combine kept dash rows with non-dash rows
-    df = pd.concat([non_dash_rows, keep_dash_rows], ignore_index=True)
-    
+    mask = df['IsSelectedVendor'].astype(str).str.strip() == '-'
+    df = df[~mask]
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows with '-' in IsSelectedVendor. Remaining: {len(df)} rows")
     return df
@@ -284,8 +294,9 @@ def separate_plant_machinery_items(df):
     # Define items to separate
     items_to_separate = ['X-Ray', 'DWS', 'Sorter', 'TBC']
     
-    # Create a new column to track separated items
-    df['AssetCategoryName_2'] = df['AssetCategoryName'].copy()
+    # Ensure normalized category column exists
+    if 'AssetCategoryName_2' not in df.columns:
+        df['AssetCategoryName_2'] = df['AssetCategoryName']
     
     # Check if any of these items are mentioned in AssetItemName
     for item in items_to_separate:
@@ -295,35 +306,51 @@ def separate_plant_machinery_items(df):
     print("Plant & Machinery items separated successfully")
     return df
 
-def handle_office_equipments(df):
-    """In Office Equipments: change non-CCTV/FireEx/Projector/Chairs/AC/Fans/Stools to Plant & Machinery"""
-    print("Handling Office Equipments categorization...")
-    
-    # Define items that should remain as Office Equipments
-    office_equipment_items = ['CCTV', 'FireEx', 'Projector', 'Chairs', 'AC', 'Fans', 'Stools']
-    
-    # Find Office Equipments that should be changed to Plant & Machinery
-    office_equipments_mask = df['AssetCategoryName'] == 'OFFICE EQUIPMENTS'
-    
-    # Check if the item is NOT one of the allowed office equipment items
-    should_change_to_plant_machinery = office_equipments_mask.copy()
-    
-    for item in office_equipment_items:
-        item_mask = df['AssetItemName'].str.contains(item, case=False, na=False)
-        should_change_to_plant_machinery = should_change_to_plant_machinery & ~item_mask
-    
-    # Change the category
-    df.loc[should_change_to_plant_machinery, 'AssetCategoryName'] = 'PLANT & MACHINERY'
-    df.loc[should_change_to_plant_machinery, 'AssetCategoryName_2'] = 'PLANT & MACHINERY'
-    
-    # Remove dark store, counter, DS related items (but only from Office Equipments)
-    dark_store_keywords = ['dark store', 'counter', 'DS']
-    for keyword in dark_store_keywords:
-        mask = (df['UserRemarks'].str.contains(keyword, case=False, na=False) & 
-                (df['AssetCategoryName'] == 'OFFICE EQUIPMENTS'))
-        df = df[~mask]
-    
-    print("Office Equipments categorization completed")
+def normalize_asset_category_column(df):
+    """Create/normalize AssetCategoryName_2 for downstream filtering (uppercased normalized names)."""
+    print("Normalizing asset category column...")
+    # Start with original or existing
+    base = df['AssetCategoryName'].astype(str).str.strip()
+    base_upper = base.str.upper()
+    # Map common variants
+    base_upper = base_upper.replace({
+        'LEASEHOLD IMPROVEMENTS': 'LEASEHOLD',
+        'LEASE HOLD': 'LEASEHOLD',
+        'LEASEHOLD IMPROVEMENT': 'LEASEHOLD',
+        'FURNITURE': 'FURNITURE',
+        'OFFICE EQUIPMENTS': 'OFFICE EQUIPMENTS',
+    })
+    df['AssetCategoryName_2'] = base_upper
+    return df
+
+def handle_office_and_furniture(df):
+    """In Office Equipments and Furniture: except listed items, change to Plant & Machinery (case-insensitive)."""
+    print("Handling Office Equipments and Furniture categorization...")
+    allowed_items = ['CCTV', 'FireEx', 'Projector', 'Chairs', 'AC', 'Fans', 'Stools']
+    cat_series = df['AssetCategoryName'].astype(str).str.strip().str.upper()
+    is_office = cat_series == 'OFFICE EQUIPMENTS'
+    is_furniture = cat_series == 'FURNITURE'
+    should_change = (is_office | is_furniture)
+    # Exclude rows where item matches any allowed item
+    for item in allowed_items:
+        match_item = df['AssetItemName'].astype(str).str.contains(item, case=False, na=False)
+        should_change = should_change & ~match_item
+    df.loc[should_change, 'AssetCategoryName'] = 'PLANT & MACHINERY'
+    df.loc[should_change, 'AssetCategoryName_2'] = 'PLANT & MACHINERY'
+    print("Office/Furniture categorization completed")
+    return df
+
+def remove_ds_darkstore_counter(df):
+    """Remove rows where UserRemarks mention DS, dark store, or counter (case-insensitive, DS as word)."""
+    print("Removing DS/dark store/counter remarks...")
+    initial_count = len(df)
+    remarks = df['UserRemarks'].astype(str)
+    mask_ds = remarks.str.contains(r"\bds\b", case=False, na=False)
+    mask_dark = remarks.str.contains('dark store', case=False, na=False)
+    mask_counter = remarks.str.contains('counter', case=False, na=False)
+    df = df[~(mask_ds | mask_dark | mask_counter)]
+    removed_count = initial_count - len(df)
+    print(f"Removed {removed_count} rows due to DS/dark store/counter remarks")
     return df
 
 def add_mum_region_comments(df):
@@ -331,7 +358,8 @@ def add_mum_region_comments(df):
     print("Adding MUM region comments...")
     
     # Add comment for MUM region (check both MUMBAI and MUM)
-    mum_mask = (df['Region'] == 'MUMBAI') | (df['Region'] == 'MUM')
+    region_series = df['Region'].astype(str).str.strip().str.upper()
+    mum_mask = (region_series == 'MUMBAI') | (region_series == 'MUM')
     df.loc[mum_mask, 'UserRemarks'] = df.loc[mum_mask, 'UserRemarks'].astype(str) + ' [MUM Region - Centrally raised for Pan-India]'
     
     print("MUM region comments added")
@@ -404,20 +432,15 @@ def handle_amc_sorter_movement(df):
     return df, amc_items, sorter_items, rental_items
 
 def create_pivot_table(df):
-    """Create pivot table with Zone, Region, AssetCategoryName, AssetItemAmount, RequestDate"""
+    """Create pivot table with Zone, Region, AssetCategoryName_2, RequestDate, sum AssetItemAmount"""
     print("Creating pivot table...")
-    
-    # Convert RequestDate to datetime for better analysis
-    df['RequestDate'] = pd.to_datetime(df['RequestDate'], format='%d-%m-%Y', errors='coerce')
-    
-    # Create pivot table
+    df['RequestDate'] = pd.to_datetime(df['RequestDate'], errors='coerce')
     pivot_table = df.pivot_table(
-        index=['Zone', 'Region', 'AssetCategoryName'],
+        index=['Zone', 'Region', 'AssetCategoryName_2', 'RequestDate'],
         values=['AssetItemAmount'],
         aggfunc={'AssetItemAmount': 'sum'},
         fill_value=0
     ).reset_index()
-    
     print(f"Pivot table created with {len(pivot_table)} rows")
     return pivot_table
 
@@ -560,33 +583,50 @@ def process_capex_data(raw_data=None, office_locations=None):
     initial_count = len(df)
     print(f"Initial data: {initial_count} rows")
     
-    # Apply all cleaning rules
-    print("\nApplying data cleaning rules...")
-    df = add_zone_region_mapping(df, office_locations)
+    # Apply all cleaning rules in the hierarchy defined in rules.txt
+    print("\nApplying data cleaning rules in rules.txt order...")
+    # 1) remove the rejected Capex status
     df = remove_rejected_capex(df)
-    df = filter_asset_categories(df)
-    df = remove_unwanted_request_functions(df)
+    # 2) Remove '-' rows from Isselectedvendor column
     df = remove_dash_vendors(df)
+    # 3) From Requestfunction remove CS, FA, Sales, Channel, Vigilance, after checking user remarks
+    df = remove_unwanted_request_functions(df)
+    # 4) In Office Equipments and Furniture... change to Plant & Machinery (except allowed)
+    df = handle_office_and_furniture(df)
+    # After step 4, create/normalize new asset category column
+    df = normalize_asset_category_column(df)
+    # 5) Keep only computer, plant & machinery, leasehold in asset category name
+    df = filter_asset_categories_keep_three(df)
+    # 6) check user remarks & remove DS, dark store, counter rows
+    df = remove_ds_darkstore_counter(df)
+    # 7) Add Zone / Region columns and map them from branch sheet
+    df = add_zone_region_mapping(df, office_locations)
+    # 8) From requestfunction 'IT' select, check remarks and delete non-relevant
     df = filter_it_requests(df)
+    # 9) Remove some rows from 'approval in progress', 'sent for approval' after checking remarks/tool
     df = remove_approval_progress_requests(df)
+    # 10) From 'UserRemarks' select dark store mentioned and delete (idempotent safety)
     df = remove_dark_store_requests(df)
+    # 11) From requestfunction 'Admin' select, check remarks and delete non-relevant
     df = filter_admin_requests(df)
+    # 12) From requestfunction 'Ops' select, check remarks and delete non-relevant
     df = filter_ops_requests(df)
+    # 13) From requestfunction 'Ops through IT' select, check remarks and delete non-relevant
     df = filter_ops_through_it_requests(df)
-    df = separate_plant_machinery_items(df)
-    df = handle_office_equipments(df)
-    df = add_mum_region_comments(df)
-    df = remove_non_ops_equipment(df)
-    df, amc_items, sorter_items, rental_items = handle_amc_sorter_movement(df)
-    
-    # Filter by final_data RequestNos to match the expected output
-    df = filter_by_final_data_requestnos(df)
-    
-    # Select representative rows per RequestNo to match final_data structure
-    df = select_representative_rows_per_requestno(df)
-    
-    # Create pivot table
+    # 14) Make pivot with Zone, Region, AssetCategoryName_2, RequestDate, AssetItemAmount
     pivot_table = create_pivot_table(df)
+    # 15) Separate X-Ray, DWS, Sorter, TBC from 'plant and machinery'
+    df = separate_plant_machinery_items(df)
+    # 16) Check for AMC and Sorter movement and separate the Rental Opex
+    df, amc_items, sorter_items, rental_items = handle_amc_sorter_movement(df)
+    # 17) Put separate comments for MUM region
+    df = add_mum_region_comments(df)
+    # 18) Check Assetitemname & itemcategory to remove non-Ops items
+    df = remove_non_ops_equipment(df)
+
+    # Optional post-processing to align with existing outputs
+    df = filter_by_final_data_requestnos(df)
+    df = select_representative_rows_per_requestno(df)
     
     # Note: Data is processed but not saved to disk
     # Files will be available for download through the UI
@@ -729,16 +769,18 @@ def validate_processed_data(processed_data, reference_data):
         if 'Zone' in processed_data.columns and 'Zone' in reference_data.columns:
             zone_mismatches = 0
             for requestno in matched_requestnos:
-                proc_zones = set(processed_data[processed_data['RequestNo'] == requestno]['Zone'].dropna())
-                ref_zones = set(reference_data[reference_data['RequestNo'] == requestno]['Zone'].dropna())
-                
+                proc_zones_raw = set(processed_data[processed_data['RequestNo'] == requestno]['Zone'].dropna())
+                ref_zones_raw = set(reference_data[reference_data['RequestNo'] == requestno]['Zone'].dropna())
+                # Normalize case and whitespace for comparison
+                proc_zones = {str(z).strip().casefold() for z in proc_zones_raw}
+                ref_zones = {str(z).strip().casefold() for z in ref_zones_raw}
                 if proc_zones != ref_zones:
                     zone_mismatches += 1
                     field_mismatches.append({
                         'type': 'Zone Mismatch',
                         'RequestNo': requestno,
-                        'processed_zones': list(proc_zones),
-                        'reference_zones': list(ref_zones)
+                        'processed_zones': list(proc_zones_raw),
+                        'reference_zones': list(ref_zones_raw)
                     })
             
             zone_accuracy = ((len(matched_requestnos) - zone_mismatches) / len(matched_requestnos)) * 100 if len(matched_requestnos) > 0 else 100

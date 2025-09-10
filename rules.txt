@@ -1,18 +1,18 @@
-From the Raw data	
-1	Add Zone / Region columns and map them from branch pan india sheet with branch code
-2	remove the rejected Capex status
-3	keep only computer, plant & machinery, leasehold in asset category name, remove everything else
-4	From Requestfunction Column, remove CS, FA, Sales, Channel, Vigilance, after checking user remarks
-5	Remove '-' rows from Isselectedvendor column
-6	From requestfunction column 'IT' , select it, check user remarks and delete which are not relevant
-7	Remove some rows from 'approval in progress', 'sent for approval' Capex status after checking the specific user remarks or capex status in capex tool, Also check Capex approval status in tool and take decision accordingly
-8	From 'UserRemarks" Column, select dark store mentioned in comments and delete the rows
-9	From requestfunction column 'Admin' , select it, check user remarks and delete which are not relevant
-10	From requestfunction column 'Ops' , select it, check user remarks and delete which are not relevant
-11	From requestfunction column 'Ops through IT' , select it, check user remarks and delete which are not relevant
-12	Make pivot with columns - Zone, Region, Assetcategory name, Asset Item amount, requestDate from working data sheet
-13	Separate X-Ray, DWS, Sorter, TBC from 'plant and machinery' and calculate
-14	Check for AMC and Sorter movement from Ajinkya and seprate the Rental Opex from overall utilization calculation
-15	"In Office Equipments and Furniture Categories..  1) Other than CCTV, FireEx, Projector, Chairs, AC, Fans, Stools -- All will be part of MHE budget and change the asset category to ""Plant & Machinery"".  check user remarks also & remove DS, dark store, counter, rows"
-16	Put separate comments for MUM region as most of the Capex raised centrally for Pan-India
-17	Check "Assetitemname" & "itemcategory" as well for removing CCTV or other equipment category not part of Ops Capex budget
+1	remove the rejected Capex status
+2	Remove '-' rows from Isselectedvendor column
+3	From Requestfunction Column, remove CS, FA, Sales, Channel, Vigilance, after checking user remarks
+4	"In Office Equipments and Furniture Categories.. 1) Other than CCTV, FireEx, Projector, Chairs, AC, Fans, Stools -- All will be part of MHE budget and change the asset category to ""Plant & Machinery"". "
+5	After step 4 & creating new asset category Column, keep only computer, plant & machinery, leasehold in asset category name, remove everything else
+6	check user remarks also & remove DS, dark store, counter, rows
+7	Add Zone / Region columns and map them from branch panindia sheet with branch code
+8	From requestfunction column 'IT' , select it, check user remarks and delete which are not relevant
+9	Remove some rows from 'approval in progress', 'sent for approval' Capex status after checking the specific user remarks or capex status in capex tool, Also check Capex approval status in tool and take decision accordingly
+10	From 'UserRemarks" Column, select dark store mentioned in comments and delete the rows
+11	From requestfunction column 'Admin' , select it, check user remarks and delete which are not relevant
+12	From requestfunction column 'Ops' , select it, check user remarks and delete which are not relevant
+13	From requestfunction column 'Ops through IT' , select it, check user remarks and delete which are not relevant
+14	Make pivot with columns - Zone, Region, Assetcategory name, Asset Item amount, requestDate from working data sheet
+15	Separate X-Ray, DWS, Sorter, TBC from 'plant and machinery' and calculate
+16	Check for AMC and Sorter movement and seprate the Rental Opex from overall utilization calculation
+17	Put separate comments for MUM region as most of the Capex raised centrally for Pan-India
+18	Check "Assetitemname" & "itemcategory" as well for removing CCTV or other equipment category not part of Ops Capex budget

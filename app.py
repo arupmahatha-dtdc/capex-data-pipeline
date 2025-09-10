@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 from process_capex import process_capex_from_dataframe, validate_processed_data
 import io
 import base64
@@ -237,7 +235,7 @@ def main():
             "📊 Processed Data", 
             "📈 Pivot Table", 
             "🔧 Specialized Items",
-            "📊 Analytics & Charts",
+            "📊 Analytics & Summary",
             "🔍 Data Validation",
             "📋 Processing Log"
         ])
@@ -315,54 +313,7 @@ def main():
                 st.info("No Rental Opex items found in the data.")
             
         with output_tab4:
-            st.markdown("### Analytics & Visualizations")
-            
-            # Zone distribution
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### Zone Distribution")
-                zone_counts = st.session_state.processed_data['Zone'].value_counts()
-                fig_zone = px.pie(
-                    values=zone_counts.values, 
-                    names=zone_counts.index,
-                    title="Records by Zone"
-                )
-                st.plotly_chart(fig_zone, use_container_width=True)
-            
-            with col2:
-                st.markdown("#### Asset Category Distribution")
-                asset_counts = st.session_state.processed_data['AssetCategoryName'].value_counts()
-                fig_asset = px.bar(
-                    x=asset_counts.index, 
-                    y=asset_counts.values,
-                    title="Records by Asset Category"
-                )
-                st.plotly_chart(fig_asset, use_container_width=True)
-            
-            # Amount distribution
-            col3, col4 = st.columns(2)
-            
-            with col3:
-                st.markdown("#### Zone-wise Capex Amount")
-                zone_amounts = st.session_state.processed_data.groupby('Zone')['AssetItemAmount'].sum().sort_values(ascending=False)
-                fig_amount = px.bar(
-                    x=zone_amounts.index, 
-                    y=zone_amounts.values,
-                    title="Capex Amount by Zone"
-                )
-                fig_amount.update_layout(yaxis_title="Amount (₹)")
-                st.plotly_chart(fig_amount, use_container_width=True)
-            
-            with col4:
-                st.markdown("#### Request Function Distribution")
-                function_counts = st.session_state.processed_data['RequestFunction'].value_counts()
-                fig_function = px.pie(
-                    values=function_counts.values, 
-                    names=function_counts.index,
-                    title="Records by Request Function"
-                )
-                st.plotly_chart(fig_function, use_container_width=True)
+            st.markdown("### Analytics & Summary")
             
             # Detailed statistics
             st.markdown("#### Detailed Statistics")
@@ -377,7 +328,8 @@ def main():
             
             # Asset category summary
             st.markdown("##### Asset Category Summary")
-            asset_summary = st.session_state.processed_data.groupby('AssetCategoryName').agg({
+            category_col = 'AssetCategoryName_2' if 'AssetCategoryName_2' in st.session_state.processed_data.columns else 'AssetCategoryName'
+            asset_summary = st.session_state.processed_data.groupby(category_col).agg({
                 'AssetItemAmount': ['count', 'sum', 'mean']
             }).round(2)
             asset_summary.columns = ['Count', 'Total_Amount', 'Average_Amount']
@@ -562,7 +514,6 @@ def main():
         with col3:
             st.markdown("""
             **📈 Analytics & Reports**
-            - Interactive Charts
             - Summary Statistics
             - Data Validation
             - Processing Log
