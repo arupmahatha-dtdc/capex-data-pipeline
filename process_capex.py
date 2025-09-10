@@ -2,6 +2,192 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import re
+import os
+from functools import lru_cache
+
+# ------------------------------
+# Remark parsing utilities (negation-aware)
+# ------------------------------
+
+# Precompile common patterns used across filters
+_NEGATION_WORDS = [
+    'no', 'not', 'without', 'exclude', 'excluding', 'except', 'avoid', 'cancel', 'cancelled', 'drop', 'skip'
+]
+_IT_NON_RELEVANT = [
+    'test', 'demo', 'sample', 'trial', 'pilot', 'experimental'
+]
+_PERSONAL_NONBUSINESS = [
+    'personal', 'individual', 'non-business', 'non operational', 'non-operational'
+]
+_EXPERIMENTAL = ['experimental']
+_DARK_STORE = ['dark store', 'dark-store', 'darkstores', 'darkstore']
+_COUNTER = ['counter']
+_DS_WORD_BOUNDARY = re.compile(r"\bds\b", flags=re.IGNORECASE)
+
+def _normalize_remark(remark: str) -> str:
+    if remark is None or (isinstance(remark, float) and np.isnan(remark)):
+        return ""
+    return str(remark).strip()
+
+def _tokens(text: str) -> list:
+    return re.findall(r"[a-zA-Z0-9']+", text.lower())
+
+def _contains_phrase(text_lower: str, phrase: str) -> list:
+    # Return list of match spans for a phrase (case-insensitive)
+    return [m.span() for m in re.finditer(re.escape(phrase.lower()), text_lower)]
+
+def _is_negated(text_lower: str, span: tuple, window_words: int = 3) -> bool:
+    # Check up to window_words before the match for negation words
+    start_idx, _ = span
+    # Get preceding substring and last few tokens
+    preceding = text_lower[:start_idx]
+    tokens = _tokens(preceding)
+    if not tokens:
+        return False
+    window = tokens[-window_words:]
+    return any(neg in window for neg in _NEGATION_WORDS)
+
+def _any_phrase_with_negation_awareness(text: str, phrases: list) -> bool:
+    tl = text.lower()
+    for phrase in phrases:
+        for span in _contains_phrase(tl, phrase):
+            if not _is_negated(tl, span):
+                return True
+    return False
+
+def _contains_whole_word(text: str, word: str) -> bool:
+    if not word:
+        return False
+    pattern = re.compile(rf"\b{re.escape(word)}\b", flags=re.IGNORECASE)
+    return bool(pattern.search(str(text)))
+
+def remark_flags(remark: str) -> dict:
+    """Analyze a remark string and return boolean flags for downstream rules.
+    By default uses negation-aware keyword parser; can optionally use LLM/zero-shot
+    classifier if enabled via env var ENABLE_LLM_REMARKS=true.
+    """
+    norm = _normalize_remark(remark)
+    tl = norm.lower()
+
+    # Base deterministic flags
+    base_flags = {
+        'is_test_demo': _any_phrase_with_negation_awareness(norm, _IT_NON_RELEVANT),
+        'is_personal_nonbusiness': _any_phrase_with_negation_awareness(norm, _PERSONAL_NONBUSINESS),
+        'is_experimental': _any_phrase_with_negation_awareness(norm, _EXPERIMENTAL),
+        'mentions_dark_store': _any_phrase_with_negation_awareness(norm, _DARK_STORE),
+        'mentions_counter': _any_phrase_with_negation_awareness(norm, _COUNTER),
+        'mentions_ds_word': bool(_DS_WORD_BOUNDARY.search(tl)),
+    }
+
+    # Optional LLM enhancement
+    if os.getenv('ENABLE_LLM_REMARKS', 'false').strip().lower() == 'true' and norm:
+        llm_flags = _llm_remark_flags_with_cache(norm)
+        # Merge with logical OR so LLM can only widen detections; regex for DS stays as-is
+        merged = base_flags.copy()
+        for key, value in llm_flags.items():
+            if key in merged:
+                merged[key] = bool(merged[key] or value)
+            else:
+                merged[key] = bool(value)
+        return merged
+
+    return base_flags
+
+# ------------------------------
+# Optional LLM-backed interpreter
+# ------------------------------
+
+@lru_cache(maxsize=4096)
+def _llm_remark_flags_with_cache(text: str) -> dict:
+    try:
+        return _llm_remark_flags(text)
+    except Exception:
+        # Fail safe to keyword-based if LLM not available or errors
+        return {
+            'is_test_demo': False,
+            'is_personal_nonbusiness': False,
+            'is_experimental': False,
+            'mentions_dark_store': False,
+            'mentions_counter': False,
+        }
+
+def _llm_remark_flags(text: str) -> dict:
+    provider = os.getenv('LLM_PROVIDER', 'auto').strip().lower()
+    if provider == 'openai' or (provider == 'auto' and os.getenv('OPENAI_API_KEY')):
+        try:
+            import openai  # type: ignore
+            client = openai.OpenAI()
+            model = os.getenv('OPENAI_REMARKS_MODEL', 'gpt-4o-mini')
+            system = (
+                "You are a classifier for procurement CAPEX remarks. "
+                "Return a strict JSON object with boolean fields: "
+                "is_test_demo, is_personal_nonbusiness, is_experimental, "
+                "mentions_dark_store, mentions_counter."
+            )
+            user = (
+                "Classify the following remark. Only reply with JSON.\n" + text
+            )
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0
+            )
+            content = resp.choices[0].message.content or "{}"
+            import json
+            parsed = json.loads(content)
+            return {
+                'is_test_demo': bool(parsed.get('is_test_demo', False)),
+                'is_personal_nonbusiness': bool(parsed.get('is_personal_nonbusiness', False)),
+                'is_experimental': bool(parsed.get('is_experimental', False)),
+                'mentions_dark_store': bool(parsed.get('mentions_dark_store', False)),
+                'mentions_counter': bool(parsed.get('mentions_counter', False)),
+            }
+        except Exception:
+            # Fall through to transformers if available
+            pass
+
+    # Transformers zero-shot fallback
+    try:
+        from transformers import pipeline  # type: ignore
+        # Support fully offline loading
+        local_only_env = os.getenv('HF_ZSC_LOCAL_ONLY', '').strip().lower()
+        local_files_only = (local_only_env == 'true') or (os.getenv('NO_INTERNET', '').strip().lower() == 'true')
+        model_path = os.getenv('HF_ZSC_MODEL_PATH') or os.getenv('HF_ZSC_MODEL', 'facebook/bart-large-mnli')
+        classifier = pipeline(
+            'zero-shot-classification',
+            model=model_path,
+            local_files_only=local_files_only
+        )
+        labels = [
+            'test/demo/sample/pilot/experimental',
+            'personal or non-business',
+            'experimental R&D',
+            'dark store related',
+            'counter related',
+        ]
+        hypothesis_template = 'This remark is {}.'
+        result = classifier(text, candidate_labels=labels, hypothesis_template=hypothesis_template, multi_label=True)
+        scores = {lbl: sc for lbl, sc in zip(result['labels'], result['scores'])}
+        def s(lbl):
+            return float(scores.get(lbl, 0.0))
+        # Threshold can be tuned via env
+        thr = float(os.getenv('ZSC_THRESHOLD', '0.5'))
+        return {
+            'is_test_demo': s('test/demo/sample/pilot/experimental') >= thr,
+            'is_personal_nonbusiness': s('personal or non-business') >= thr,
+            'is_experimental': s('experimental R&D') >= thr,
+            'mentions_dark_store': s('dark store related') >= thr,
+            'mentions_counter': s('counter related') >= thr,
+        }
+    except Exception:
+        # Nothing available
+        return {
+            'is_test_demo': False,
+            'is_personal_nonbusiness': False,
+            'is_experimental': False,
+            'mentions_dark_store': False,
+            'mentions_counter': False,
+        }
 
 def load_office_locations():
     """Load office location mapping file"""
@@ -54,11 +240,12 @@ def add_zone_region_mapping(df, office_locations):
         # Apply fallback mapping for unmapped rows
         fallback_mapped_count = 0
         for idx in df[unmapped_mask].index:
-            user_remarks = str(df.loc[idx, 'UserRemarks']).upper()
+            user_remarks = str(df.loc[idx, 'UserRemarks'])
             
-            # Check if any region code is contained in UserRemarks
+            # Check if any region code is contained in UserRemarks as whole word
             for region_code, zone in regioncode_to_zone.items():
-                if region_code in user_remarks:
+                pattern = re.compile(rf"\b{re.escape(str(region_code))}\b", flags=re.IGNORECASE)
+                if pattern.search(user_remarks):
                     df.loc[idx, 'Zone'] = zone
                     df.loc[idx, 'Region'] = regioncode_to_region[region_code]
                     fallback_mapped_count += 1
@@ -126,17 +313,18 @@ def filter_it_requests(df):
     it_requests = df[df['RequestFunction'] == 'IT'].copy()
     non_it_requests = df[df['RequestFunction'] != 'IT'].copy()
     
-    # Define keywords that indicate non-relevant IT requests
-    non_relevant_keywords = [
-        'test', 'demo', 'sample', 'trial', 'pilot', 'experimental',
-        'personal', 'individual', 'non-business', 'non-operational'
-    ]
-    
-    # Filter out non-relevant IT requests
-    relevant_it_requests = it_requests.copy()
-    for keyword in non_relevant_keywords:
-        mask = relevant_it_requests['UserRemarks'].str.contains(keyword, case=False, na=False)
-        relevant_it_requests = relevant_it_requests[~mask]
+    # Use remark parsing (negation-aware)
+    if 'UserRemarks' not in it_requests.columns:
+        relevant_it_requests = it_requests
+    else:
+        flags_df = it_requests['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        # Non-relevant if any of these categories are true
+        non_relevant_mask = (
+            flags_df['is_test_demo'] |
+            flags_df['is_personal_nonbusiness'] |
+            flags_df['is_experimental']
+        )
+        relevant_it_requests = it_requests[~non_relevant_mask]
     
     # Combine relevant IT requests with non-IT requests
     df = pd.concat([relevant_it_requests, non_it_requests], ignore_index=True)
@@ -157,17 +345,16 @@ def remove_approval_progress_requests(df):
     approval_rows = df[df['CurrentStatus'].isin(statuses_to_filter)].copy()
     other_rows = df[~df['CurrentStatus'].isin(statuses_to_filter)].copy()
     
-    # Define keywords that indicate rows to REMOVE from approval statuses
-    remove_keywords = [
-        'test', 'demo', 'sample', 'trial', 'personal', 'individual',
-        'non-business', 'non-operational', 'experimental'
-    ]
-    
-    # Keep only relevant approval status rows (remove those with remove_keywords)
+    # Keep only relevant approval status rows using remark parsing
     relevant_approval_rows = approval_rows.copy()
-    for keyword in remove_keywords:
-        mask = relevant_approval_rows['UserRemarks'].str.contains(keyword, case=False, na=False)
-        relevant_approval_rows = relevant_approval_rows[~mask]
+    if 'UserRemarks' in relevant_approval_rows.columns:
+        flags_df = relevant_approval_rows['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        remove_mask = (
+            flags_df['is_test_demo'] |
+            flags_df['is_personal_nonbusiness'] |
+            flags_df['is_experimental']
+        )
+        relevant_approval_rows = relevant_approval_rows[~remove_mask]
     
     # Additional filtering: Remove most "Approval in Progress" rows (keep only very specific ones)
     approval_in_progress = relevant_approval_rows[relevant_approval_rows['CurrentStatus'] == 'Approval in Progress']
@@ -195,9 +382,11 @@ def remove_dark_store_requests(df):
     print("Removing dark store requests...")
     initial_count = len(df)
     
-    # Remove rows containing 'dark store' in user remarks
-    mask = df['UserRemarks'].str.contains('dark store', case=False, na=False)
-    df = df[~mask]
+    # Remove rows mentioning dark store, negation-aware
+    if 'UserRemarks' in df.columns:
+        flags_df = df['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        mask = flags_df['mentions_dark_store']
+        df = df[~mask]
     
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} dark store requests. Remaining: {len(df)} rows")
@@ -212,17 +401,17 @@ def filter_admin_requests(df):
     admin_requests = df[df['RequestFunction'] == 'Admin'].copy()
     non_admin_requests = df[df['RequestFunction'] != 'Admin'].copy()
     
-    # Define keywords that indicate non-relevant Admin requests
-    non_relevant_keywords = [
-        'personal', 'individual', 'non-business', 'non-operational',
-        'test', 'demo', 'sample'
-    ]
-    
-    # Filter out non-relevant Admin requests
-    relevant_admin_requests = admin_requests.copy()
-    for keyword in non_relevant_keywords:
-        mask = relevant_admin_requests['UserRemarks'].str.contains(keyword, case=False, na=False)
-        relevant_admin_requests = relevant_admin_requests[~mask]
+    # Use remark parsing
+    if 'UserRemarks' not in admin_requests.columns:
+        relevant_admin_requests = admin_requests
+    else:
+        flags_df = admin_requests['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        non_relevant_mask = (
+            flags_df['is_personal_nonbusiness'] |
+            flags_df['is_test_demo'] |
+            flags_df['is_experimental']
+        )
+        relevant_admin_requests = admin_requests[~non_relevant_mask]
     
     # Combine relevant Admin requests with non-Admin requests
     df = pd.concat([relevant_admin_requests, non_admin_requests], ignore_index=True)
@@ -240,17 +429,17 @@ def filter_ops_requests(df):
     ops_requests = df[df['RequestFunction'] == 'Ops'].copy()
     non_ops_requests = df[df['RequestFunction'] != 'Ops'].copy()
     
-    # Define keywords that indicate non-relevant Ops requests
-    non_relevant_keywords = [
-        'personal', 'individual', 'non-business', 'non-operational',
-        'test', 'demo', 'sample'
-    ]
-    
-    # Filter out non-relevant Ops requests
-    relevant_ops_requests = ops_requests.copy()
-    for keyword in non_relevant_keywords:
-        mask = relevant_ops_requests['UserRemarks'].str.contains(keyword, case=False, na=False)
-        relevant_ops_requests = relevant_ops_requests[~mask]
+    # Use remark parsing
+    if 'UserRemarks' not in ops_requests.columns:
+        relevant_ops_requests = ops_requests
+    else:
+        flags_df = ops_requests['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        non_relevant_mask = (
+            flags_df['is_personal_nonbusiness'] |
+            flags_df['is_test_demo'] |
+            flags_df['is_experimental']
+        )
+        relevant_ops_requests = ops_requests[~non_relevant_mask]
     
     # Combine relevant Ops requests with non-Ops requests
     df = pd.concat([relevant_ops_requests, non_ops_requests], ignore_index=True)
@@ -268,17 +457,17 @@ def filter_ops_through_it_requests(df):
     ops_it_requests = df[df['RequestFunction'] == 'Ops through IT'].copy()
     non_ops_it_requests = df[df['RequestFunction'] != 'Ops through IT'].copy()
     
-    # Define keywords that indicate non-relevant Ops through IT requests
-    non_relevant_keywords = [
-        'personal', 'individual', 'non-business', 'non-operational',
-        'test', 'demo', 'sample'
-    ]
-    
-    # Filter out non-relevant Ops through IT requests
-    relevant_ops_it_requests = ops_it_requests.copy()
-    for keyword in non_relevant_keywords:
-        mask = relevant_ops_it_requests['UserRemarks'].str.contains(keyword, case=False, na=False)
-        relevant_ops_it_requests = relevant_ops_it_requests[~mask]
+    # Use remark parsing
+    if 'UserRemarks' not in ops_it_requests.columns:
+        relevant_ops_it_requests = ops_it_requests
+    else:
+        flags_df = ops_it_requests['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        non_relevant_mask = (
+            flags_df['is_personal_nonbusiness'] |
+            flags_df['is_test_demo'] |
+            flags_df['is_experimental']
+        )
+        relevant_ops_it_requests = ops_it_requests[~non_relevant_mask]
     
     # Combine relevant Ops through IT requests with others
     df = pd.concat([relevant_ops_it_requests, non_ops_it_requests], ignore_index=True)
@@ -344,11 +533,12 @@ def remove_ds_darkstore_counter(df):
     """Remove rows where UserRemarks mention DS, dark store, or counter (case-insensitive, DS as word)."""
     print("Removing DS/dark store/counter remarks...")
     initial_count = len(df)
-    remarks = df['UserRemarks'].astype(str)
-    mask_ds = remarks.str.contains(r"\bds\b", case=False, na=False)
-    mask_dark = remarks.str.contains('dark store', case=False, na=False)
-    mask_counter = remarks.str.contains('counter', case=False, na=False)
-    df = df[~(mask_ds | mask_dark | mask_counter)]
+    if 'UserRemarks' in df.columns:
+        flags_df = df['UserRemarks'].apply(remark_flags).apply(pd.Series)
+        mask_ds = flags_df['mentions_ds_word']
+        mask_dark = flags_df['mentions_dark_store']
+        mask_counter = flags_df['mentions_counter']
+        df = df[~(mask_ds | mask_dark | mask_counter)]
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows due to DS/dark store/counter remarks")
     return df
