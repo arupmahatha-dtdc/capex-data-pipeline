@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from process_capex import process_capex_from_dataframe, validate_processed_data
+from process_capex import process_capex_from_dataframe, validate_processed_data, validate_all_sheets_composite_keys
 import io
 import base64
 import os
@@ -69,22 +69,6 @@ def create_download_link(df, filename, link_text):
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" style="text-decoration: none; color: #1f77b4; font-weight: bold;">{link_text}</a>'
     return href
 
-def display_dataframe_summary(df, title):
-    """Display a summary of a DataFrame"""
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Rows", len(df))
-    with col2:
-        st.metric("Total Columns", len(df.columns))
-    with col3:
-        if 'AssetItemAmount' in df.columns:
-            total_amount = df['AssetItemAmount'].sum()
-            st.metric("Total Amount", f"₹{total_amount:,.2f}")
-        else:
-            st.metric("Data Type", "Mapping Data")
-    with col4:
-        st.metric("Memory Usage", f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
 
 def load_office_locations():
     """Load office locations from fixed file"""
@@ -148,8 +132,6 @@ def main():
         st.session_state.sorter_items = None
     if 'rental_items' not in st.session_state:
         st.session_state.rental_items = None
-    if 'processing_log' not in st.session_state:
-        st.session_state.processing_log = []
     if 'validation_results' not in st.session_state:
         st.session_state.validation_results = None
     if 'reference_data' not in st.session_state:
@@ -183,14 +165,6 @@ def main():
                 st.session_state.sorter_items = sorter_items if len(sorter_items) > 0 else None
                 st.session_state.rental_items = rental_items if len(rental_items) > 0 else None
                 
-                # Add to processing log
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state.processing_log.append({
-                    'timestamp': timestamp,
-                    'initial_records': len(raw_data),
-                    'final_records': len(processed_data),
-                    'total_amount': processed_data['AssetItemAmount'].sum()
-                })
                 
                 st.success("✅ Data processed successfully!")
                 
@@ -208,15 +182,16 @@ def main():
                 reference_data = pd.read_csv(reference_data_file)
                 st.session_state.reference_data = reference_data
                 
-                # Run validation
-                with st.spinner("Validating data... This may take a few moments."):
-                    validation_results = validate_processed_data(
-                        st.session_state.processed_data, 
-                        reference_data
+                # Run comprehensive validation
+                with st.spinner("Running comprehensive validation across all sheets... This may take a few moments."):
+                    validation_results = validate_all_sheets_composite_keys(
+                        st.session_state.raw_data,  # Input data
+                        st.session_state.processed_data,  # Processed data
+                        reference_data  # Reference data
                     )
                 
                 st.session_state.validation_results = validation_results
-                st.success("✅ Data validation completed!")
+                st.success("✅ Comprehensive validation completed!")
                 
             except Exception as e:
                 st.error(f"❌ Error during validation: {str(e)}")
@@ -231,18 +206,16 @@ def main():
         st.markdown('<h2 class="section-header">📤 Generated Sheets & Analysis</h2>', unsafe_allow_html=True)
         
         # Main output tabs
-        output_tab1, output_tab2, output_tab3, output_tab4, output_tab5, output_tab6 = st.tabs([
+        output_tab1, output_tab2, output_tab3, output_tab4, output_tab5 = st.tabs([
             "📊 Processed Data", 
             "📈 Pivot Table", 
             "🔧 Specialized Items",
             "📊 Analytics & Summary",
-            "🔍 Data Validation",
-            "📋 Processing Log"
+            "🔍 Data Validation"
         ])
         
         with output_tab1:
             st.markdown("### Processed Capex Data")
-            display_dataframe_summary(st.session_state.processed_data, "Processed Data")
             
             # Show all columns
             st.markdown("#### All Data (All Columns)")
@@ -257,7 +230,6 @@ def main():
             
         with output_tab2:
             st.markdown("### Pivot Table")
-            display_dataframe_summary(st.session_state.pivot_data, "Pivot Table")
             
             # Display pivot table with all columns
             st.markdown("#### Pivot Table (All Columns)")
@@ -276,7 +248,6 @@ def main():
             # AMC Items
             if st.session_state.amc_items is not None:
                 st.markdown("#### AMC Items (All Columns)")
-                display_dataframe_summary(st.session_state.amc_items, "AMC Items")
                 st.dataframe(st.session_state.amc_items, use_container_width=True)
                 st.markdown(create_download_link(
                     st.session_state.amc_items, 
@@ -289,7 +260,6 @@ def main():
             # Sorter Items
             if st.session_state.sorter_items is not None:
                 st.markdown("#### Sorter Items (All Columns)")
-                display_dataframe_summary(st.session_state.sorter_items, "Sorter Items")
                 st.dataframe(st.session_state.sorter_items, use_container_width=True)
                 st.markdown(create_download_link(
                     st.session_state.sorter_items, 
@@ -302,7 +272,6 @@ def main():
             # Rental Items
             if st.session_state.rental_items is not None:
                 st.markdown("#### Rental Opex Items (All Columns)")
-                display_dataframe_summary(st.session_state.rental_items, "Rental Items")
                 st.dataframe(st.session_state.rental_items, use_container_width=True)
                 st.markdown(create_download_link(
                     st.session_state.rental_items, 
@@ -344,132 +313,143 @@ def main():
             st.dataframe(function_summary, use_container_width=True)
             
         with output_tab5:
-            st.markdown("### Data Validation Results")
+            st.markdown("### Comprehensive Data Validation Results")
             
             if st.session_state.validation_results is not None:
                 validation_results = st.session_state.validation_results
                 
-                # Validation summary
-                col1, col2, col3, col4 = st.columns(4)
+                # Overall validation summary
+                st.markdown("#### ML Metrics Summary")
+                summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
                 
-                with col1:
-                    status_color = "🟢" if validation_results['summary']['validation_status'] == 'PASS' else "🔴"
-                    st.metric("Validation Status", f"{status_color} {validation_results['summary']['validation_status']}")
+                with summary_col1:
+                    status_color = "🟢" if validation_results['summary']['overall_status'] == 'PASS' else "🔴"
+                    st.metric("Overall Status", f"{status_color} {validation_results['summary']['overall_status']}")
                 
-                with col2:
-                    st.metric("Overall Accuracy", f"{validation_results['summary']['overall_accuracy']}%")
+                with summary_col2:
+                    st.metric("Precision", f"{validation_results['summary']['precision']:.4f}")
                 
-                with col3:
-                    st.metric("Matched RequestNos", validation_results['matched_records'])
+                with summary_col3:
+                    st.metric("Recall", f"{validation_results['summary']['recall']:.4f}")
                 
-                with col4:
-                    st.metric("Total Mismatches", validation_results['summary']['total_mismatches'])
+                with summary_col4:
+                    st.metric("F1-Score", f"{validation_results['summary']['f1_score']:.4f}")
                 
-                # RequestNo matching metrics
-                st.markdown("#### RequestNo Matching Metrics")
-                accuracy_metrics = validation_results['accuracy_metrics']
+                # Removed per request: Additional Metrics and Individual Sheet Validation
                 
-                match_col1, match_col2, match_col3, match_col4 = st.columns(4)
-                
-                with match_col1:
-                    if 'match_accuracy' in accuracy_metrics:
-                        st.metric("Match Accuracy", f"{accuracy_metrics['match_accuracy']}%")
-                
-                with match_col2:
-                    if 'matched_count' in accuracy_metrics:
-                        st.metric("Matched Count", accuracy_metrics['matched_count'])
-                
-                with match_col3:
-                    if 'only_in_processed_count' in accuracy_metrics:
-                        st.metric("Only in Processed", accuracy_metrics['only_in_processed_count'])
-                
-                with match_col4:
-                    if 'only_in_reference_count' in accuracy_metrics:
-                        st.metric("Only in Reference", accuracy_metrics['only_in_reference_count'])
-                
-                # Field comparison metrics (for matched records)
-                if validation_results['matched_records'] > 0:
-                    st.markdown("#### Field Comparison (Matched Records Only)")
-                    field_col1, field_col2, field_col3 = st.columns(3)
+                # ML Validation Results
+                st.markdown("#### ML Validation Results")
+                ml_val = validation_results.get('ml_validation', {})
+                if ml_val and ml_val.get('ml_metrics'):
+                    ml_metrics = ml_val['ml_metrics']
                     
-                    with field_col1:
-                        if 'amount_accuracy' in accuracy_metrics:
-                            st.metric("Amount Accuracy", f"{accuracy_metrics['amount_accuracy']}%")
+                    # True Positives, False Positives, False Negatives
+                    st.markdown("##### Confusion Matrix Components")
+                    cm_col1, cm_col2, cm_col3 = st.columns(3)
+                    with cm_col1:
+                        st.metric("True Positives", ml_metrics.get('true_positives', 0))
+                    with cm_col2:
+                        st.metric("False Positives", ml_metrics.get('false_positives', 0))
+                    with cm_col3:
+                        st.metric("False Negatives", ml_metrics.get('false_negatives', 0))
                     
-                    with field_col2:
-                        if 'zone_accuracy' in accuracy_metrics:
-                            st.metric("Zone Accuracy", f"{accuracy_metrics['zone_accuracy']}%")
-                    
-                    with field_col3:
-                        if 'category_accuracy' in accuracy_metrics:
-                            st.metric("Category Accuracy", f"{accuracy_metrics['category_accuracy']}%")
-                
-                # Mismatches
-                if validation_results['mismatches']:
-                    st.markdown("#### Mismatches Found")
-                    
-                    for i, mismatch in enumerate(validation_results['mismatches']):
-                        with st.expander(f"Mismatch {i+1}: {mismatch['type']}"):
-                            if mismatch['type'] == 'Only in Processed Data':
-                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
-                                st.write(f"**Description:** {mismatch['description']}")
-                            
-                            elif mismatch['type'] == 'Only in Reference Data':
-                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
-                                st.write(f"**Description:** {mismatch['description']}")
-                            
-                            elif mismatch['type'] == 'Amount Mismatch':
-                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
-                                st.write(f"**Processed Amount:** ₹{mismatch['processed_amount']:,.2f}")
-                                st.write(f"**Reference Amount:** ₹{mismatch['reference_amount']:,.2f}")
-                                st.write(f"**Difference:** ₹{mismatch['difference']:,.2f}")
-                            
-                            elif mismatch['type'] == 'Zone Mismatch':
-                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
-                                st.write(f"**Processed Zones:** {mismatch['processed_zones']}")
-                                st.write(f"**Reference Zones:** {mismatch['reference_zones']}")
-                            
-                            elif mismatch['type'] == 'Category Mismatch':
-                                st.write(f"**RequestNo:** {mismatch['RequestNo']}")
-                                st.write(f"**Processed Categories:** {mismatch['processed_categories']}")
-                                st.write(f"**Reference Categories:** {mismatch['reference_categories']}")
+                    # Field-level accuracy if available
+                    if 'amount_accuracy' in ml_metrics:
+                        st.markdown("##### Field-Level Accuracy")
+                        field_col1, field_col2, field_col3 = st.columns(3)
+                        with field_col1:
+                            st.metric("Amount Accuracy", f"{ml_metrics.get('amount_accuracy', 0):.2f}%")
+                        with field_col2:
+                            st.metric("Zone Accuracy", f"{ml_metrics.get('zone_accuracy', 0):.2f}%")
+                        with field_col3:
+                            st.metric("Category Accuracy", f"{ml_metrics.get('category_accuracy', 0):.2f}%")
                 else:
-                    st.success("🎉 No mismatches found! Data validation passed completely.")
+                    st.info("ML validation results not available")
                 
-                # Download validation report
-                st.markdown("#### Download Validation Report")
-                validation_df = pd.DataFrame(validation_results['mismatches'])
-                if not validation_df.empty:
-                    st.markdown(create_download_link(
-                        validation_df, 
-                        "validation_report.csv", 
-                        "📥 Download Validation Report"
-                    ), unsafe_allow_html=True)
+                # Mismatches table
+                st.markdown("#### Mismatches Found")
+                if validation_results['all_mismatches']:
+                    # Convert mismatches to DataFrame for better display
+                    all_mismatches_df = pd.DataFrame(validation_results['all_mismatches'])
+                    
+                    # Display detailed mismatches in two separate tables
+                    if not all_mismatches_df.empty:
+                        # Split into two tables based on mismatch type
+                        false_positives = all_mismatches_df[
+                            all_mismatches_df['type'] == 'False Positive'
+                        ]
+                        false_negatives = all_mismatches_df[
+                            all_mismatches_df['type'] == 'False Negative'
+                        ]
+                        
+                        # Table 1: False Positives (Only in Processed)
+                        st.markdown("##### False Positives (Incorrectly Included)")
+                        if not false_positives.empty:
+                            fp_display = false_positives[['RequestNo', 'AssetItemName', 'CompositeKey']].copy()
+                            st.dataframe(fp_display, use_container_width=True)
+                            
+                            # Download false positive mismatches
+                            st.markdown(create_download_link(
+                                fp_display, 
+                                "false_positives_mismatches.csv", 
+                                "📥 Download False Positives"
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.success("✅ No False Positives found!")
+                        
+                        # Table 2: False Negatives (Only in Reference)
+                        st.markdown("##### False Negatives (Incorrectly Excluded)")
+                        if not false_negatives.empty:
+                            # Include exclusion reason if available
+                            cols = ['RequestNo', 'AssetItemName', 'CompositeKey']
+                            # Try to expand structured reason into columns if present
+                            if 'exclusion_reason' in false_negatives.columns:
+                                # Normalize dict-like reasons to columns
+                                def unpack_reason(x):
+                                    if isinstance(x, dict):
+                                        return x
+                                    return {'label': x}
+                                reason_df = false_negatives['exclusion_reason'].apply(unpack_reason).apply(pd.Series)
+                                # Merge for display
+                                fn_display = pd.concat([false_negatives[cols].reset_index(drop=True), reason_df.reset_index(drop=True)], axis=1)
+                                # Friendly headers
+                                fn_display = fn_display.rename(columns={
+                                    'label': 'Excluded By (rules.txt)',
+                                    'column': 'Trigger Column',
+                                    'value': 'Trigger Value'
+                                })
+                            else:
+                                fn_display = false_negatives[cols].copy()
+                            st.dataframe(fn_display, use_container_width=True)
+                            
+                            # Download false negative mismatches
+                            st.markdown(create_download_link(
+                                fn_display, 
+                                "false_negatives_mismatches.csv", 
+                                "📥 Download False Negatives"
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.success("✅ No False Negatives found!")
+                    else:
+                        st.success("✅ No mismatches found between Processed and Reference data!")
+                    
+                    # Show count of mismatches
+                    total_mismatches = len(all_mismatches_df)
+                    false_positive_count = len(false_positives)
+                    false_negative_count = len(false_negatives)
+                    st.info(f"Showing {false_positive_count} False Positives and {false_negative_count} False Negatives out of {total_mismatches} total mismatches.")
+                    
                 else:
-                    st.info("No mismatches to download.")
+                    st.success("🎉 No mismatches found! All validations passed completely.")
+                
+                # Removed per request: Duplicate Keys Details section
                 
             else:
                 st.info("No validation results available. Please upload reference data and run validation.")
                 
                 if st.session_state.reference_data is not None:
                     st.markdown("#### Reference Data Summary")
-                    display_dataframe_summary(st.session_state.reference_data, "Reference Data")
             
-        with output_tab6:
-            st.markdown("### Processing Log")
-            
-            if st.session_state.processing_log:
-                log_df = pd.DataFrame(st.session_state.processing_log)
-                st.dataframe(log_df, use_container_width=True)
-                
-                # Download log
-                st.markdown(create_download_link(
-                    log_df, 
-                    "processing_log.csv", 
-                    "📥 Download Processing Log"
-                ), unsafe_allow_html=True)
-            else:
-                st.info("No processing log available yet.")
     
     else:
         # Welcome message

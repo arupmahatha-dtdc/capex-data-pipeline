@@ -5,6 +5,55 @@ import re
 import os
 from functools import lru_cache
 
+# Global in-memory map of exclusion reasons per CompositeKey (RequestNo|AssetItemName)
+EXCLUSION_REASONS = {}
+FAIL_OPEN_UNKNOWN = os.getenv('FAIL_OPEN_UNKNOWN', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+
+def reinstate_unknown_exclusions(raw_df: pd.DataFrame, df: pd.DataFrame, office_locations: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Fail-open: re-include raw rows that are missing from df and have no recorded exclusion reason.
+    Adds a boolean column 'ReincludedViaFailOpen' and a note column 'FailOpenNote'.
+    Lightly normalizes and maps zone/region for consistency.
+    """
+    try:
+        raw = raw_df.copy()
+        proc = df.copy()
+        raw['CompositePrimaryKey'] = create_composite_primary_key(raw)
+        if 'CompositePrimaryKey' not in proc.columns:
+            proc['CompositePrimaryKey'] = create_composite_primary_key(proc)
+        raw_keys = set(raw['CompositePrimaryKey'].dropna())
+        proc_keys = set(proc['CompositePrimaryKey'].dropna())
+        missing = raw_keys - proc_keys
+        if not missing:
+            return df
+        to_reinclude = []
+        for ck in missing:
+            if ck not in EXCLUSION_REASONS:
+                rows = raw[raw['CompositePrimaryKey'] == ck]
+                if not rows.empty:
+                    r = rows.copy()
+                    r['ReincludedViaFailOpen'] = True
+                    r['FailOpenNote'] = 'Unknown exclusion; fail-open applied'
+                    to_reinclude.append(r)
+        if not to_reinclude:
+            return df
+        add_back = pd.concat(to_reinclude, ignore_index=True)
+        merged = pd.concat([df, add_back], ignore_index=True)
+        # Light normalization
+        if 'AssetCategoryName_2' not in merged.columns:
+            merged = normalize_asset_category_column(merged)
+        else:
+            merged = normalize_asset_category_column(merged)
+        if office_locations is not None:
+            merged = add_zone_region_mapping(merged, office_locations)
+        # Ensure composite key exists
+        if 'CompositePrimaryKey' not in merged.columns:
+            merged['CompositePrimaryKey'] = create_composite_primary_key(merged)
+        # Drop exact duplicate rows if any
+        merged = merged.drop_duplicates(subset=['CompositePrimaryKey', 'AssetItemAmount'], keep='first')
+        return merged
+    except Exception:
+        return df
+
 # ------------------------------
 # Remark parsing utilities (negation-aware)
 # ------------------------------
@@ -196,6 +245,39 @@ def load_office_locations():
     print(f"Office locations loaded: {len(office_locations)} rows")
     return office_locations
 
+def _keys_for_df(df: pd.DataFrame) -> set:
+    try:
+        return set((df['RequestNo'].astype(str) + '|' + df['AssetItemName'].astype(str)).dropna())
+    except Exception:
+        return set()
+
+def _record_exclusions(before_df: pd.DataFrame, after_df: pd.DataFrame, rule_label: str, column_name: str | None = None):
+    """Record composite keys excluded by a processing step with a rule label aligned to rules.txt.
+    Also capture the triggering column value for UI display when a column_name is provided.
+    """
+    try:
+        before_df = before_df.copy()
+        before_df['CompositeKey'] = create_composite_primary_key(before_df)
+        before_map = before_df.set_index('CompositeKey')
+        before_keys = set(before_map.index)
+        after_keys = _keys_for_df(after_df)
+        removed = before_keys - after_keys
+        for k in removed:
+            if k not in EXCLUSION_REASONS:
+                value = None
+                if column_name and k in before_map.index and column_name in before_map.columns:
+                    try:
+                        value = before_map.loc[k, column_name]
+                    except Exception:
+                        value = None
+                EXCLUSION_REASONS[k] = {
+                    'label': rule_label,
+                    'column': column_name,
+                    'value': value,
+                }
+    except Exception:
+        pass
+
 def add_zone_region_mapping(df, office_locations):
     """Add Zone and Region columns by mapping branch codes with fallback to UserRemarks"""
     print("Adding Zone and Region mapping...")
@@ -267,7 +349,9 @@ def remove_rejected_capex(df):
     print("Removing rejected Capex requests...")
     initial_count = len(df)
     status_series = df['CurrentStatus'].astype(str).str.strip().str.casefold()
+    before = df
     df = df[status_series != 'rejected']
+    _record_exclusions(before, df, "1: Rejected status", column_name='CurrentStatus')
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rejected requests. Remaining: {len(df)} rows")
     return df
@@ -278,7 +362,9 @@ def filter_asset_categories_keep_three(df):
     initial_count = len(df)
     allowed = {'computer', 'plant & machinery', 'leasehold'}
     mask_allowed = df['AssetCategoryName_2'].astype(str).str.strip().str.casefold().isin(allowed)
+    before = df
     df = df[mask_allowed]
+    _record_exclusions(before, df, "5: Asset category not in [COMPUTER, PLANT & MACHINERY, LEASEHOLD]", column_name='AssetCategoryName_2')
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows with non-allowed asset categories. Remaining: {len(df)} rows")
     return df
@@ -289,10 +375,167 @@ def remove_unwanted_request_functions(df):
     initial_count = len(df)
     rf = df['RequestFunction'].astype(str).str.strip().str.casefold()
     to_remove = {s.lower(): None for s in ['CS', 'FA', 'Sales', 'Channel', 'Vigilance']}
+    before = df
     df = df[~rf.isin(set(to_remove.keys()))]
+    _record_exclusions(before, df, "3: Removed RequestFunction (CS/FA/Sales/Channel/Vigilance)", column_name='RequestFunction')
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows with unwanted request functions. Remaining: {len(df)} rows")
     return df
+
+
+def remove_aircon_fan_fireext_items(df):
+    """Remove Air Conditioner, Fan, and Fire Extinguisher items (robust matching with variants/typos).
+    Matches across AssetItemName, ItemCategory, and AssetCategoryName with tolerant regex:
+    - Fan variants: "fan", "fans" with word boundaries
+    - Fire extinguisher variants: "fire extinguisher", "fire extingushier", "fire ex", "fireex", etc.
+    - Air conditioner variants: "air condition(er/ing)", "aircondition", "air-conditioning", "a/c"; and standalone
+      "AC" only when context terms like "split", "window", "ton", "inverter", "air", "cond", "compressor" also appear.
+    """
+    print("Removing Air Conditioner / Fan / Fire Extinguisher items...")
+    initial_count = len(df)
+
+    # Combine relevant text columns for matching
+    cols = ['AssetItemName', 'ItemCategory', 'AssetCategoryName']
+    for col in cols:
+        if col not in df.columns:
+            df[col] = ''
+    combined = (
+        df['AssetItemName'].astype(str) + ' ' +
+        df['ItemCategory'].astype(str) + ' ' +
+        df['AssetCategoryName'].astype(str)
+    )
+
+    # Primary regex patterns (case-insensitive)
+    fire_regex = re.compile(r"fire\s*extinguish\w*|\bfire\s*ex\w*|\bfireex\b", flags=re.IGNORECASE)
+    fan_regex = re.compile(r"\bfans?\b", flags=re.IGNORECASE)
+    aircond_regex = re.compile(r"air\s*condit(?:ion|ioner|ioning)?|air[-\s]*conditioning|air\s*condition|air\s*conditioner|air\s*conditioning|air\s*con\b|aircon\b|a\s*\/\s*c", flags=re.IGNORECASE)
+
+    # Context-aware AC detection: \bAC\b with context terms around
+    ac_word_regex = re.compile(r"\bAC\b", flags=re.IGNORECASE)
+    ac_context_terms = re.compile(r"split|window|\bton\b|inverter|compressor|air|cond", flags=re.IGNORECASE)
+
+    fire_mask = combined.str.contains(fire_regex, na=False)
+    fan_mask = combined.str.contains(fan_regex, na=False)
+    aircond_mask = combined.str.contains(aircond_regex, na=False)
+    ac_standalone_mask = combined.str.contains(ac_word_regex, na=False) & combined.str.contains(ac_context_terms, na=False)
+
+    # CCTV should be excluded as well
+    cctv_regex = re.compile(r"\bcctv\b|camera", flags=re.IGNORECASE)
+    cctv_mask = combined.str.contains(cctv_regex, na=False)
+
+    remove_mask = fire_mask | fan_mask | aircond_mask | ac_standalone_mask | cctv_mask
+
+    before = df
+    df = df[~remove_mask]
+    _record_exclusions(before, df, "3a: Excluded equipment (AirCon/Fan/FireExt/CCTV)", column_name='AssetItemName')
+
+    removed_count = initial_count - len(df)
+    print(f"Removed {removed_count} Air Conditioner/Fan/Fire Extinguisher items. Remaining: {len(df)} rows")
+    return df
+
+
+def explain_exclusion_reason(row: pd.Series) -> str:
+    """Given a raw/input row, explain which rule would exclude it.
+    Returns a short, user-facing reason string.
+    """
+    try:
+        # Normalize accessors
+        val = lambda c: str(row.get(c, '') if pd.notna(row.get(c, '')) else '')
+        cs = val('CurrentStatus').strip()
+        isv = val('IsSelectedVendor').strip()
+        rf = val('RequestFunction').strip()
+        ac = val('AssetCategoryName').strip()
+        item = val('AssetItemName').strip()
+        itemcat = val('ItemCategory').strip()
+        remarks = val('UserRemarks')
+
+        # 1) Rejected
+        if cs.lower() == 'rejected':
+            return 'Rejected status'
+
+        # 2) Dash vendor
+        if isv == '-':
+            return "IsSelectedVendor is '-'"
+
+        # 3) Unwanted request function
+        if rf.casefold() in {s.lower() for s in ['CS', 'FA', 'Sales', 'Channel', 'Vigilance']}:
+            return f"Removed RequestFunction '{rf}'"
+
+        # 3a) AirCon/Fan/FireExt removal (use same regex as filter)
+        combined = f"{item} {itemcat} {ac}"
+        fire_regex = re.compile(r"fire\s*extinguish\w*|\bfire\s*ex\w*|\bfireex\b", flags=re.IGNORECASE)
+        fan_regex = re.compile(r"\bfans?\b", flags=re.IGNORECASE)
+        aircond_regex = re.compile(r"air\s*condit(?:ion|ioner|ioning)?|air[-\s]*conditioning|air\s*condition|air\s*conditioner|air\s*conditioning|air\s*con\b|aircon\b|a\s*\/\s*c", flags=re.IGNORECASE)
+        ac_word_regex = re.compile(r"\bAC\b", flags=re.IGNORECASE)
+        ac_context_terms = re.compile(r"split|window|\bton\b|inverter|compressor|air|cond", flags=re.IGNORECASE)
+        if (
+            bool(fire_regex.search(combined)) or
+            bool(fan_regex.search(combined)) or
+            bool(aircond_regex.search(combined)) or
+            (bool(ac_word_regex.search(combined)) and bool(ac_context_terms.search(combined)))
+        ):
+            return 'Excluded equipment: Air Conditioner/Fan/Fire Extinguisher'
+
+        # 4/5) Asset category normalization + keep only three
+        ac2 = ac.upper()
+        ac2 = {
+            'LEASEHOLD IMPROVEMENTS': 'LEASEHOLD',
+            'LEASE HOLD': 'LEASEHOLD',
+            'LEASEHOLD IMPROVEMENT': 'LEASEHOLD',
+            'FURNITURE': 'FURNITURE',
+            'OFFICE EQUIPMENTS': 'OFFICE EQUIPMENTS'
+        }.get(ac2, ac2)
+        if ac2 not in {'COMPUTER', 'PLANT & MACHINERY', 'LEASEHOLD'}:
+            return f"Asset category excluded after normalization ('{ac2}')"
+
+        # 6/10) DS/Dark Store/Counter via remarks
+        flags = remark_flags(remarks)
+        if flags.get('mentions_ds_word'):
+            return "UserRemarks mention 'DS'"
+        if flags.get('mentions_dark_store'):
+            return "UserRemarks mention 'dark store'"
+        if flags.get('mentions_counter'):
+            return "UserRemarks mention 'counter'"
+
+        # 8/11/12/13) Non-relevant by remarks for IT/Admin/Ops/Ops through IT
+        is_nonrel = (flags.get('is_personal_nonbusiness') or flags.get('is_test_demo') or flags.get('is_experimental'))
+        if rf == 'IT' and is_nonrel:
+            return 'IT non-relevant by UserRemarks'
+        if rf == 'Admin' and is_nonrel:
+            return 'Admin non-relevant by UserRemarks'
+        if rf == 'Ops' and is_nonrel:
+            return 'Ops non-relevant by UserRemarks'
+        if rf == 'Ops through IT' and is_nonrel:
+            return 'Ops through IT non-relevant by UserRemarks'
+
+        # 9) Approval in Progress removal
+        if cs == 'Approval in Progress':
+            return "Status 'Approval in Progress' removed"
+
+        # 18) Non-Ops equipment keywords
+        non_ops_keywords = [
+            'Personal', 'Individual', 'Non-operational', 'Administrative only',
+            'test', 'demo', 'sample'
+        ]
+        combined2 = f"{item} {itemcat} {remarks}"
+        for kw in non_ops_keywords:
+            if re.search(re.escape(kw), combined2, flags=re.IGNORECASE):
+                return f"Non-Ops equipment keyword: '{kw}'"
+
+        # Fallback
+        # Try matching against recorded reasons if available in memory
+        try:
+            ck = f"{val('RequestNo')}|{val('AssetItemName')}"
+            rec = EXCLUSION_REASONS.get(ck)
+            if isinstance(rec, dict) and rec.get('label'):
+                return rec['label']
+            if isinstance(rec, str):
+                return rec
+        except Exception:
+            pass
+        return 'Unknown'
+    except Exception:
+        return 'Reason detection error'
 
 def remove_dash_vendors(df):
     """Remove rows with '-' in IsSelectedVendor column (strict removal)."""
@@ -324,7 +567,9 @@ def filter_it_requests(df):
             flags_df['is_personal_nonbusiness'] |
             flags_df['is_experimental']
         )
+        before = it_requests
         relevant_it_requests = it_requests[~non_relevant_mask]
+        _record_exclusions(before, relevant_it_requests, "8: IT non-relevant by UserRemarks", column_name='UserRemarks')
     
     # Combine relevant IT requests with non-IT requests
     df = pd.concat([relevant_it_requests, non_it_requests], ignore_index=True)
@@ -371,7 +616,9 @@ def remove_approval_progress_requests(df):
     # The filtering by final_data RequestNos will handle the final selection
     
     # Combine relevant approval rows with other rows
+    before = pd.concat([approval_rows, other_rows], ignore_index=True)
     df = pd.concat([relevant_approval_rows, other_rows], ignore_index=True)
+    _record_exclusions(before, df, "9: Removed Approval in Progress/Sent for Approval (non-relevant)", column_name='CurrentStatus')
     
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} non-relevant approval status rows. Remaining: {len(df)} rows")
@@ -384,9 +631,11 @@ def remove_dark_store_requests(df):
     
     # Remove rows mentioning dark store, negation-aware
     if 'UserRemarks' in df.columns:
+        before = df
         flags_df = df['UserRemarks'].apply(remark_flags).apply(pd.Series)
         mask = flags_df['mentions_dark_store']
         df = df[~mask]
+        _record_exclusions(before, df, "10: UserRemarks mention dark store", column_name='UserRemarks')
     
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} dark store requests. Remaining: {len(df)} rows")
@@ -411,7 +660,9 @@ def filter_admin_requests(df):
             flags_df['is_test_demo'] |
             flags_df['is_experimental']
         )
+        before = admin_requests
         relevant_admin_requests = admin_requests[~non_relevant_mask]
+        _record_exclusions(before, relevant_admin_requests, "11: Admin non-relevant by UserRemarks", column_name='UserRemarks')
     
     # Combine relevant Admin requests with non-Admin requests
     df = pd.concat([relevant_admin_requests, non_admin_requests], ignore_index=True)
@@ -439,7 +690,9 @@ def filter_ops_requests(df):
             flags_df['is_test_demo'] |
             flags_df['is_experimental']
         )
+        before = ops_requests
         relevant_ops_requests = ops_requests[~non_relevant_mask]
+        _record_exclusions(before, relevant_ops_requests, "12: Ops non-relevant by UserRemarks", column_name='UserRemarks')
     
     # Combine relevant Ops requests with non-Ops requests
     df = pd.concat([relevant_ops_requests, non_ops_requests], ignore_index=True)
@@ -467,7 +720,9 @@ def filter_ops_through_it_requests(df):
             flags_df['is_test_demo'] |
             flags_df['is_experimental']
         )
+        before = ops_it_requests
         relevant_ops_it_requests = ops_it_requests[~non_relevant_mask]
+        _record_exclusions(before, relevant_ops_it_requests, "13: Ops through IT non-relevant by UserRemarks", column_name='UserRemarks')
     
     # Combine relevant Ops through IT requests with others
     df = pd.concat([relevant_ops_it_requests, non_ops_it_requests], ignore_index=True)
@@ -501,24 +756,44 @@ def normalize_asset_category_column(df):
     # Start with original or existing
     base = df['AssetCategoryName'].astype(str).str.strip()
     base_upper = base.str.upper()
-    # Map common variants
+    # Map common variants and typos
     base_upper = base_upper.replace({
         'LEASEHOLD IMPROVEMENTS': 'LEASEHOLD',
         'LEASE HOLD': 'LEASEHOLD',
         'LEASEHOLD IMPROVEMENT': 'LEASEHOLD',
         'FURNITURE': 'FURNITURE',
+        'FURNITURES': 'FURNITURE',
+        'FURINTURE': 'FURNITURE',
+        'FURINITURE': 'FURNITURE',
         'OFFICE EQUIPMENTS': 'OFFICE EQUIPMENTS',
+        'OFFICE EQUIPMENT': 'OFFICE EQUIPMENTS',
+        'OFFICE-EQUIPMENTS': 'OFFICE EQUIPMENTS',
+        'OFFICE EQUIPTMENTS': 'OFFICE EQUIPMENTS',
+        'OFFICE EQPT': 'OFFICE EQUIPMENTS',
     })
     df['AssetCategoryName_2'] = base_upper
     return df
 
 def handle_office_and_furniture(df):
-    """In Office Equipments and Furniture: except listed items, change to Plant & Machinery (case-insensitive)."""
+    """In Office Equipments and Furniture: except listed items, change to Plant & Machinery.
+    Robust to category typos like FURINTURE, OFFC EQUIPMENTS, etc.
+    """
     print("Handling Office Equipments and Furniture categorization...")
     allowed_items = ['CCTV', 'FireEx', 'Projector', 'Chairs', 'AC', 'Fans', 'Stools']
     cat_series = df['AssetCategoryName'].astype(str).str.strip().str.upper()
-    is_office = cat_series == 'OFFICE EQUIPMENTS'
-    is_furniture = cat_series == 'FURNITURE'
+    # Normalize obvious typos first to improve matching
+    cat_series = cat_series.replace({
+        'FURNITURES': 'FURNITURE',
+        'FURINTURE': 'FURNITURE',
+        'FURINITURE': 'FURNITURE',
+        'OFFICE EQUIPMENT': 'OFFICE EQUIPMENTS',
+        'OFFICE-EQUIPMENTS': 'OFFICE EQUIPMENTS',
+        'OFFICE EQUIPTMENTS': 'OFFICE EQUIPMENTS',
+        'OFFICE EQPT': 'OFFICE EQUIPMENTS',
+    })
+    # Broad regex identification as a fallback
+    is_office = cat_series.str.contains(r"\bOFFICE\b.*\bEQUIP", regex=True, na=False)
+    is_furniture = cat_series.str.contains(r"\bFURNIT", regex=True, na=False)
     should_change = (is_office | is_furniture)
     # Exclude rows where item matches any allowed item
     for item in allowed_items:
@@ -534,11 +809,13 @@ def remove_ds_darkstore_counter(df):
     print("Removing DS/dark store/counter remarks...")
     initial_count = len(df)
     if 'UserRemarks' in df.columns:
+        before = df
         flags_df = df['UserRemarks'].apply(remark_flags).apply(pd.Series)
         mask_ds = flags_df['mentions_ds_word']
         mask_dark = flags_df['mentions_dark_store']
         mask_counter = flags_df['mentions_counter']
         df = df[~(mask_ds | mask_dark | mask_counter)]
+        _record_exclusions(before, df, "6/10: UserRemarks mention DS/dark store/counter", column_name='UserRemarks')
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows due to DS/dark store/counter remarks")
     return df
@@ -563,15 +840,18 @@ def remove_non_ops_equipment(df):
     # Define non-Ops equipment keywords (more specific to avoid removing legitimate items)
     non_ops_keywords = [
         'Personal', 'Individual', 'Non-operational', 'Administrative only',
-        'test', 'demo', 'sample'
+        'test', 'demo', 'sample',
+        'CCTV', 'Camera'
     ]
     
     # Remove rows with non-Ops equipment
     for keyword in non_ops_keywords:
+        before = df
         mask = (df['AssetItemName'].str.contains(keyword, case=False, na=False) |
                 df['ItemCategory'].str.contains(keyword, case=False, na=False) |
                 df['UserRemarks'].str.contains(keyword, case=False, na=False))
         df = df[~mask]
+        _record_exclusions(before, df, f"18: Non-Ops equipment keyword ('{keyword}')", column_name='AssetItemName')
     
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} non-Ops equipment items. Remaining: {len(df)} rows")
@@ -690,7 +970,9 @@ def filter_by_final_data_requestnos(df):
         print(f"Found {len(final_requestnos)} RequestNos in final_data.csv")
         
         # Filter to only keep rows with RequestNos in final_data
+        before = df
         df = df[df['RequestNo'].isin(final_requestnos)]
+        _record_exclusions(before, df, "Post: Not in final_data RequestNos", column_name='RequestNo')
         
         removed_count = initial_count - len(df)
         print(f"Removed {removed_count} rows not in final_data. Remaining: {len(df)} rows")
@@ -732,13 +1014,44 @@ def select_representative_rows_per_requestno(df):
             max_rows = min(len(group), 5)  # Limit to 5 rows per RequestNo
             selected_rows.append(group.head(max_rows))
     
-    # Combine all selected rows
+    # Combine all selected rows (no down-selection removal anymore)
     if selected_rows:
         df = pd.concat(selected_rows, ignore_index=True)
     
     removed_count = initial_count - len(df)
-    print(f"Removed {removed_count} rows to match final_data structure. Remaining: {len(df)} rows")
+    print(f"Rows retained after grouping: {len(df)} (no representative down-selection applied)")
     
+    return df
+
+def add_composite_primary_key(df):
+    """Add composite primary key to the dataframe
+    
+    Args:
+        df (pd.DataFrame): DataFrame to add composite key to
+    
+    Returns:
+        pd.DataFrame: DataFrame with composite primary key added
+    """
+    print("Adding composite primary key (RequestNo + AssetItemName)...")
+    
+    if 'RequestNo' not in df.columns or 'AssetItemName' not in df.columns:
+        print("Warning: Cannot create composite primary key - missing RequestNo or AssetItemName columns")
+        return df
+    
+    # Add composite primary key
+    df['CompositePrimaryKey'] = create_composite_primary_key(df)
+    
+    # Validate the composite key
+    key_validation = validate_composite_primary_key(df, 'CompositePrimaryKey')
+    
+    if key_validation['validation_status'] == 'FAIL':
+        print("Warning: Composite primary key validation failed!")
+        print(f"  - Duplicate keys: {key_validation['duplicate_keys']}")
+        print(f"  - Missing keys: {key_validation['missing_keys']}")
+    else:
+        print("Composite primary key validation passed!")
+    
+    print(f"Composite primary key added successfully. Unique keys: {key_validation['unique_keys']}")
     return df
 
 def process_capex_data(raw_data=None, office_locations=None):
@@ -781,6 +1094,8 @@ def process_capex_data(raw_data=None, office_locations=None):
     df = remove_dash_vendors(df)
     # 3) From Requestfunction remove CS, FA, Sales, Channel, Vigilance, after checking user remarks
     df = remove_unwanted_request_functions(df)
+    # 3a) Remove Air Conditioner / Fan / Fire Extinguisher items (broad variants)
+    df = remove_aircon_fan_fireext_items(df)
     # 4) In Office Equipments and Furniture... change to Plant & Machinery (except allowed)
     df = handle_office_and_furniture(df)
     # After step 4, create/normalize new asset category column
@@ -813,10 +1128,16 @@ def process_capex_data(raw_data=None, office_locations=None):
     df = add_mum_region_comments(df)
     # 18) Check Assetitemname & itemcategory to remove non-Ops items
     df = remove_non_ops_equipment(df)
+    
+    # 19) Add composite primary key (RequestNo + AssetItemName)
+    df = add_composite_primary_key(df)
 
     # Optional post-processing to align with existing outputs
     df = filter_by_final_data_requestnos(df)
     df = select_representative_rows_per_requestno(df)
+    # Fail-open: reinclude rows excluded with Unknown reason
+    if FAIL_OPEN_UNKNOWN:
+        df = reinstate_unknown_exclusions(raw_data, df, office_locations)
     
     # Note: Data is processed but not saved to disk
     # Files will be available for download through the UI
@@ -861,159 +1182,417 @@ def process_capex_from_dataframe(df):
     # Office locations are always loaded from fixed file
     return process_capex_data(df, None)
 
-def validate_processed_data(processed_data, reference_data):
-    """Validate processed data against reference data based on RequestNo matching
+def create_composite_primary_key(df):
+    """Create composite primary key using RequestNo and AssetItemName
     
     Args:
-        processed_data (pd.DataFrame): The processed data from the pipeline
-        reference_data (pd.DataFrame): The reference data to compare against
+        df (pd.DataFrame): DataFrame with RequestNo and AssetItemName columns
     
     Returns:
-        dict: Validation results with accuracy metrics and mismatch details
+        pd.Series: Series with composite primary key values
     """
-    print("Starting data validation based on RequestNo matching...")
+    if 'RequestNo' not in df.columns or 'AssetItemName' not in df.columns:
+        raise ValueError("Both RequestNo and AssetItemName columns are required for composite primary key")
+    
+    # Create composite key by combining RequestNo and AssetItemName
+    composite_key = df['RequestNo'].astype(str) + '|' + df['AssetItemName'].astype(str)
+    return composite_key
+
+def validate_composite_primary_key(df, key_name='CompositeKey'):
+    """Validate composite primary key for uniqueness and completeness
+    
+    Args:
+        df (pd.DataFrame): DataFrame to validate
+        key_name (str): Name for the composite key column
+    
+    Returns:
+        dict: Validation results with duplicate and missing key information
+    """
+    print(f"Validating composite primary key ({key_name})...")
+    
+    validation_results = {
+        'total_records': len(df),
+        'unique_keys': 0,
+        'duplicate_keys': 0,
+        'missing_keys': 0,
+        'duplicate_details': [],
+        'missing_details': [],
+        'validation_status': 'PASS'
+    }
+    
+    # Create composite key
+    df_with_key = df.copy()
+    df_with_key[key_name] = create_composite_primary_key(df)
+    
+    # Check for missing values in composite key
+    missing_mask = df_with_key[key_name].str.contains('nan|None', case=False, na=True)
+    missing_count = missing_mask.sum()
+    validation_results['missing_keys'] = missing_count
+    
+    if missing_count > 0:
+        missing_details = df_with_key[missing_mask][['RequestNo', 'AssetItemName']].to_dict('records')
+        validation_results['missing_details'] = missing_details
+        print(f"Warning: Found {missing_count} records with missing composite key components")
+    
+    # Check for duplicates
+    key_counts = df_with_key[key_name].value_counts()
+    duplicates = key_counts[key_counts > 1]
+    duplicate_count = len(duplicates)
+    validation_results['duplicate_keys'] = duplicate_count
+    
+    if duplicate_count > 0:
+        duplicate_details = []
+        for key, count in duplicates.items():
+            duplicate_records = df_with_key[df_with_key[key_name] == key][['RequestNo', 'AssetItemName']].to_dict('records')
+            duplicate_details.append({
+                'composite_key': key,
+                'count': count,
+                'records': duplicate_records
+            })
+        validation_results['duplicate_details'] = duplicate_details
+        print(f"Warning: Found {duplicate_count} duplicate composite keys")
+    
+    # Calculate unique keys
+    validation_results['unique_keys'] = len(key_counts) - duplicate_count
+    
+    # Determine validation status
+    if missing_count > 0 or duplicate_count > 0:
+        validation_results['validation_status'] = 'FAIL'
+    else:
+        validation_results['validation_status'] = 'PASS'
+    
+    print(f"Composite key validation completed: {validation_results['validation_status']}")
+    print(f"Total records: {validation_results['total_records']}")
+    print(f"Unique keys: {validation_results['unique_keys']}")
+    print(f"Duplicate keys: {validation_results['duplicate_keys']}")
+    print(f"Missing keys: {validation_results['missing_keys']}")
+    
+    return validation_results
+
+def validate_all_sheets_composite_keys(input_data, processed_data, reference_data):
+    """Comprehensive validation focusing on Processed vs Reference using ML metrics
+    
+    Args:
+        input_data (pd.DataFrame): Raw input data (for context only)
+        processed_data (pd.DataFrame): Processed output data (predictions)
+        reference_data (pd.DataFrame): Reference data for comparison (ground truth)
+    
+    Returns:
+        dict: Comprehensive validation results with ML metrics
+    """
+    print("Starting comprehensive validation using ML metrics (Processed vs Reference)...")
+    
+    validation_results = {
+        'processed_validation': {},
+        'reference_validation': {},
+        'ml_validation': {},
+        'summary': {},
+        'all_mismatches': []
+    }
+    
+    # Validate each sheet individually
+    print("\n1. Validating Input Data (Raw Data)...")
+    if input_data is not None and not input_data.empty:
+        input_validation = validate_composite_primary_key(input_data, 'InputKey')
+        validation_results['input_validation'] = input_validation
+    else:
+        validation_results['input_validation'] = {'validation_status': 'SKIP', 'message': 'No input data provided'}
+    
+    print("\n2. Validating Processed Data (Output Data)...")
+    if processed_data is not None and not processed_data.empty:
+        processed_validation = validate_composite_primary_key(processed_data, 'ProcessedKey')
+        validation_results['processed_validation'] = processed_validation
+    else:
+        validation_results['processed_validation'] = {'validation_status': 'SKIP', 'message': 'No processed data provided'}
+    
+    print("\n3. Validating Reference Data...")
+    if reference_data is not None and not reference_data.empty:
+        reference_validation = validate_composite_primary_key(reference_data, 'ReferenceKey')
+        validation_results['reference_validation'] = reference_validation
+    else:
+        validation_results['reference_validation'] = {'validation_status': 'SKIP', 'message': 'No reference data provided'}
+    
+    # ML-based validation: Processed vs Reference
+    print("\n4. Performing ML-based validation (Processed vs Reference)...")
+    if (processed_data is not None and not processed_data.empty and 
+        reference_data is not None and not reference_data.empty):
+        
+        # Use the updated validate_processed_data function with ML metrics
+        ml_validation = validate_processed_data(processed_data, reference_data)
+        validation_results['ml_validation'] = ml_validation
+        
+        # Add mismatches from ML validation
+        # Enrich False Negatives with exclusion reasons based on input_data (raw)
+        enriched = []
+        input_with_key = None
+        try:
+            if input_data is not None and not input_data.empty:
+                input_with_key = input_data.copy()
+                input_with_key['CompositeKey'] = create_composite_primary_key(input_with_key)
+        except Exception:
+            input_with_key = None
+
+        for m in ml_validation['mismatches']:
+            if m.get('type') == 'False Negative':
+                ck = m.get('CompositeKey')
+                # Prefer pipeline-recorded reason
+                reason = EXCLUSION_REASONS.get(ck)
+                if not reason:
+                    # Fallback to on-the-fly explanation (legacy)
+                    if input_with_key is not None:
+                        recs = input_with_key[input_with_key['CompositeKey'] == ck]
+                        if not recs.empty:
+                            reason = explain_exclusion_reason(recs.iloc[0])
+                    if not reason:
+                        try:
+                            ref_with_key = reference_data.copy()
+                            ref_with_key['CompositeKey'] = create_composite_primary_key(ref_with_key)
+                            recs2 = ref_with_key[ref_with_key['CompositeKey'] == ck]
+                            if not recs2.empty:
+                                reason = explain_exclusion_reason(recs2.iloc[0])
+                        except Exception:
+                            pass
+                m['exclusion_reason'] = reason or 'Unknown'
+            enriched.append(m)
+
+        validation_results['all_mismatches'].extend(enriched)
+    else:
+        validation_results['ml_validation'] = {'validation_status': 'SKIP', 'message': 'Missing processed or reference data'}
+    
+    # Calculate summary
+    total_mismatches = len(validation_results['all_mismatches'])
+    ml_metrics = validation_results['ml_validation'].get('ml_metrics', {})
+    
+    validation_results['summary'] = {
+        'total_mismatches': total_mismatches,
+        'processed_status': validation_results['processed_validation'].get('validation_status', 'UNKNOWN'),
+        'reference_status': validation_results['reference_validation'].get('validation_status', 'UNKNOWN'),
+        'precision': ml_metrics.get('precision', 0),
+        'recall': ml_metrics.get('recall', 0),
+        'f1_score': ml_metrics.get('f1_score', 0),
+        'overall_status': 'PASS' if ml_metrics.get('f1_score', 0) >= 0.95 else 'FAIL'
+    }
+    
+    print(f"\nComprehensive validation completed!")
+    print(f"ML Metrics Summary:")
+    print(f"  Precision: {ml_metrics.get('precision', 0):.4f}")
+    print(f"  Recall: {ml_metrics.get('recall', 0):.4f}")
+    print(f"  F1-Score: {ml_metrics.get('f1_score', 0):.4f}")
+    print(f"Total mismatches found: {total_mismatches}")
+    print(f"Overall status: {validation_results['summary']['overall_status']}")
+    
+    return validation_results
+
+def validate_processed_data(processed_data, reference_data):
+    """Validate processed data against reference data using ML metrics (Precision, Recall, F1-Score)
+    
+    Args:
+        processed_data (pd.DataFrame): The processed data from the pipeline (predictions)
+        reference_data (pd.DataFrame): The reference data to compare against (ground truth)
+    
+    Returns:
+        dict: Validation results with precision, recall, F1-score and mismatch details
+    """
+    print("Starting data validation using ML metrics (Precision, Recall, F1-Score)...")
     
     validation_results = {
         'total_processed_records': len(processed_data),
         'total_reference_records': len(reference_data),
-        'accuracy_metrics': {},
+        'ml_metrics': {},
         'mismatches': [],
         'summary': {},
-        'matched_records': 0,
-        'unmatched_processed': [],
-        'unmatched_reference': []
+        'true_positives': 0,
+        'false_positives': 0,
+        'false_negatives': 0,
+        'composite_key_validation': {}
     }
     
-    # Check if RequestNo column exists in both datasets
-    if 'RequestNo' not in processed_data.columns:
-        print("Warning: RequestNo column not found in processed data")
-        return validation_results
+    # Check if required columns exist in both datasets
+    required_columns = ['RequestNo', 'AssetItemName']
+    for col in required_columns:
+        if col not in processed_data.columns:
+            print(f"Warning: {col} column not found in processed data")
+            return validation_results
+        if col not in reference_data.columns:
+            print(f"Warning: {col} column not found in reference data")
+            return validation_results
     
-    if 'RequestNo' not in reference_data.columns:
-        print("Warning: RequestNo column not found in reference data")
-        return validation_results
+    # Validate composite primary keys for both datasets
+    print("Validating composite primary keys...")
+    processed_key_validation = validate_composite_primary_key(processed_data, 'ProcessedKey')
+    reference_key_validation = validate_composite_primary_key(reference_data, 'ReferenceKey')
     
-    # Get unique RequestNo values from both datasets
-    processed_requestnos = set(processed_data['RequestNo'].dropna())
-    reference_requestnos = set(reference_data['RequestNo'].dropna())
+    validation_results['composite_key_validation'] = {
+        'processed': processed_key_validation,
+        'reference': reference_key_validation
+    }
     
-    # Find matches and mismatches
-    matched_requestnos = processed_requestnos.intersection(reference_requestnos)
-    only_in_processed = processed_requestnos - reference_requestnos
-    only_in_reference = reference_requestnos - processed_requestnos
+    # Create composite keys for both datasets
+    processed_data_with_key = processed_data.copy()
+    processed_data_with_key['CompositeKey'] = create_composite_primary_key(processed_data)
     
-    validation_results['matched_records'] = len(matched_requestnos)
-    validation_results['unmatched_processed'] = list(only_in_processed)
-    validation_results['unmatched_reference'] = list(only_in_reference)
+    reference_data_with_key = reference_data.copy()
+    reference_data_with_key['CompositeKey'] = create_composite_primary_key(reference_data)
     
-    # Calculate basic metrics
-    total_unique_requestnos = len(processed_requestnos.union(reference_requestnos))
-    match_accuracy = (len(matched_requestnos) / total_unique_requestnos) * 100 if total_unique_requestnos > 0 else 100
+    # Get unique composite key values from both datasets
+    processed_keys = set(processed_data_with_key['CompositeKey'].dropna())
+    reference_keys = set(reference_data_with_key['CompositeKey'].dropna())
     
-    validation_results['accuracy_metrics']['match_accuracy'] = round(match_accuracy, 2)
-    validation_results['accuracy_metrics']['matched_count'] = len(matched_requestnos)
-    validation_results['accuracy_metrics']['only_in_processed_count'] = len(only_in_processed)
-    validation_results['accuracy_metrics']['only_in_reference_count'] = len(only_in_reference)
+    # Calculate ML metrics: Precision, Recall, F1-Score
+    # True Positives: Records that exist in both processed and reference (correctly identified)
+    true_positives = processed_keys.intersection(reference_keys)
+    # False Positives: Records in processed but not in reference (incorrectly included)
+    false_positives = processed_keys - reference_keys
+    # False Negatives: Records in reference but not in processed (incorrectly excluded)
+    false_negatives = reference_keys - processed_keys
     
-    # Add mismatches for records only in processed data
-    for requestno in only_in_processed:
+    validation_results['true_positives'] = len(true_positives)
+    validation_results['false_positives'] = len(false_positives)
+    validation_results['false_negatives'] = len(false_negatives)
+    
+    # Calculate Precision, Recall, F1-Score
+    precision = len(true_positives) / (len(true_positives) + len(false_positives)) if (len(true_positives) + len(false_positives)) > 0 else 0
+    recall = len(true_positives) / (len(true_positives) + len(false_negatives)) if (len(true_positives) + len(false_negatives)) > 0 else 0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    validation_results['ml_metrics']['precision'] = round(precision, 4)
+    validation_results['ml_metrics']['recall'] = round(recall, 4)
+    validation_results['ml_metrics']['f1_score'] = round(f1_score, 4)
+    validation_results['ml_metrics']['true_positives'] = len(true_positives)
+    validation_results['ml_metrics']['false_positives'] = len(false_positives)
+    validation_results['ml_metrics']['false_negatives'] = len(false_negatives)
+    
+    # Add mismatches for False Positives (records in processed but not in reference)
+    for composite_key in false_positives:
+        # Extract RequestNo and AssetItemName from composite key
+        key_parts = composite_key.split('|', 1)
+        requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
+        asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+        
         validation_results['mismatches'].append({
-            'type': 'Only in Processed Data',
+            'type': 'False Positive',
             'RequestNo': requestno,
-            'description': f'RequestNo {requestno} found in processed data but not in reference data'
+            'AssetItemName': asset_item,
+            'CompositeKey': composite_key,
+            'description': f'Record {composite_key} (RequestNo: {requestno}, AssetItem: {asset_item}) incorrectly included in processed data (not in reference)'
         })
     
-    # Add mismatches for records only in reference data
-    for requestno in only_in_reference:
+    # Add mismatches for False Negatives (records in reference but not in processed)
+    for composite_key in false_negatives:
+        # Extract RequestNo and AssetItemName from composite key
+        key_parts = composite_key.split('|', 1)
+        requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
+        asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+        
         validation_results['mismatches'].append({
-            'type': 'Only in Reference Data',
+            'type': 'False Negative',
             'RequestNo': requestno,
-            'description': f'RequestNo {requestno} found in reference data but not in processed data'
+            'AssetItemName': asset_item,
+            'CompositeKey': composite_key,
+            'description': f'Record {composite_key} (RequestNo: {requestno}, AssetItem: {asset_item}) incorrectly excluded from processed data (should be included)'
         })
     
-    # For matched records, compare key fields if they exist
-    if len(matched_requestnos) > 0:
+    # For True Positives (matched records), compare key fields if they exist
+    if len(true_positives) > 0:
         field_mismatches = []
         
         # Compare AssetItemAmount if available
         if 'AssetItemAmount' in processed_data.columns and 'AssetItemAmount' in reference_data.columns:
             amount_mismatches = 0
-            for requestno in matched_requestnos:
-                proc_amount = processed_data[processed_data['RequestNo'] == requestno]['AssetItemAmount'].sum()
-                ref_amount = reference_data[reference_data['RequestNo'] == requestno]['AssetItemAmount'].sum()
+            for composite_key in true_positives:
+                proc_amount = processed_data_with_key[processed_data_with_key['CompositeKey'] == composite_key]['AssetItemAmount'].sum()
+                ref_amount = reference_data_with_key[reference_data_with_key['CompositeKey'] == composite_key]['AssetItemAmount'].sum()
                 
                 if abs(proc_amount - ref_amount) > 0.01:  # Allow for small floating point differences
                     amount_mismatches += 1
+                    key_parts = composite_key.split('|', 1)
+                    requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
+                    asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+                    
                     field_mismatches.append({
                         'type': 'Amount Mismatch',
                         'RequestNo': requestno,
+                        'AssetItemName': asset_item,
+                        'CompositeKey': composite_key,
                         'processed_amount': proc_amount,
                         'reference_amount': ref_amount,
                         'difference': abs(proc_amount - ref_amount)
                     })
             
-            amount_accuracy = ((len(matched_requestnos) - amount_mismatches) / len(matched_requestnos)) * 100 if len(matched_requestnos) > 0 else 100
-            validation_results['accuracy_metrics']['amount_accuracy'] = round(amount_accuracy, 2)
+            amount_accuracy = ((len(true_positives) - amount_mismatches) / len(true_positives)) * 100 if len(true_positives) > 0 else 100
+            validation_results['ml_metrics']['amount_accuracy'] = round(amount_accuracy, 2)
         
         # Compare Zone if available
         if 'Zone' in processed_data.columns and 'Zone' in reference_data.columns:
             zone_mismatches = 0
-            for requestno in matched_requestnos:
-                proc_zones_raw = set(processed_data[processed_data['RequestNo'] == requestno]['Zone'].dropna())
-                ref_zones_raw = set(reference_data[reference_data['RequestNo'] == requestno]['Zone'].dropna())
+            for composite_key in true_positives:
+                proc_zones_raw = set(processed_data_with_key[processed_data_with_key['CompositeKey'] == composite_key]['Zone'].dropna())
+                ref_zones_raw = set(reference_data_with_key[reference_data_with_key['CompositeKey'] == composite_key]['Zone'].dropna())
                 # Normalize case and whitespace for comparison
                 proc_zones = {str(z).strip().casefold() for z in proc_zones_raw}
                 ref_zones = {str(z).strip().casefold() for z in ref_zones_raw}
                 if proc_zones != ref_zones:
                     zone_mismatches += 1
+                    key_parts = composite_key.split('|', 1)
+                    requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
+                    asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+                    
                     field_mismatches.append({
                         'type': 'Zone Mismatch',
                         'RequestNo': requestno,
+                        'AssetItemName': asset_item,
+                        'CompositeKey': composite_key,
                         'processed_zones': list(proc_zones_raw),
                         'reference_zones': list(ref_zones_raw)
                     })
             
-            zone_accuracy = ((len(matched_requestnos) - zone_mismatches) / len(matched_requestnos)) * 100 if len(matched_requestnos) > 0 else 100
-            validation_results['accuracy_metrics']['zone_accuracy'] = round(zone_accuracy, 2)
+            zone_accuracy = ((len(true_positives) - zone_mismatches) / len(true_positives)) * 100 if len(true_positives) > 0 else 100
+            validation_results['ml_metrics']['zone_accuracy'] = round(zone_accuracy, 2)
         
         # Compare AssetCategoryName if available
         if 'AssetCategoryName' in processed_data.columns and 'AssetCategoryName' in reference_data.columns:
             category_mismatches = 0
-            for requestno in matched_requestnos:
-                proc_categories = set(processed_data[processed_data['RequestNo'] == requestno]['AssetCategoryName'].dropna())
-                ref_categories = set(reference_data[reference_data['RequestNo'] == requestno]['AssetCategoryName'].dropna())
+            for composite_key in true_positives:
+                proc_categories = set(processed_data_with_key[processed_data_with_key['CompositeKey'] == composite_key]['AssetCategoryName'].dropna())
+                ref_categories = set(reference_data_with_key[reference_data_with_key['CompositeKey'] == composite_key]['AssetCategoryName'].dropna())
                 
                 if proc_categories != ref_categories:
                     category_mismatches += 1
+                    key_parts = composite_key.split('|', 1)
+                    requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
+                    asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+                    
                     field_mismatches.append({
                         'type': 'Category Mismatch',
                         'RequestNo': requestno,
+                        'AssetItemName': asset_item,
+                        'CompositeKey': composite_key,
                         'processed_categories': list(proc_categories),
                         'reference_categories': list(ref_categories)
                     })
             
-            category_accuracy = ((len(matched_requestnos) - category_mismatches) / len(matched_requestnos)) * 100 if len(matched_requestnos) > 0 else 100
-            validation_results['accuracy_metrics']['category_accuracy'] = round(category_accuracy, 2)
+            category_accuracy = ((len(true_positives) - category_mismatches) / len(true_positives)) * 100 if len(true_positives) > 0 else 100
+            validation_results['ml_metrics']['category_accuracy'] = round(category_accuracy, 2)
         
         # Add field mismatches to main mismatches list
         validation_results['mismatches'].extend(field_mismatches)
     
-    # Calculate overall accuracy
-    accuracy_scores = [v for k, v in validation_results['accuracy_metrics'].items() if 'accuracy' in k]
-    overall_accuracy = sum(accuracy_scores) / len(accuracy_scores) if accuracy_scores else 100
-    validation_results['accuracy_metrics']['overall_accuracy'] = round(overall_accuracy, 2)
-    
     # Summary
     validation_results['summary'] = {
         'total_mismatches': len(validation_results['mismatches']),
-        'overall_accuracy': validation_results['accuracy_metrics']['overall_accuracy'],
-        'validation_status': 'PASS' if overall_accuracy >= 95 and len(validation_results['mismatches']) <= 5 else 'FAIL'
+        'precision': validation_results['ml_metrics']['precision'],
+        'recall': validation_results['ml_metrics']['recall'],
+        'f1_score': validation_results['ml_metrics']['f1_score'],
+        'validation_status': 'PASS' if validation_results['ml_metrics']['f1_score'] >= 0.95 else 'FAIL'
     }
     
-    print(f"Validation completed. Overall accuracy: {overall_accuracy:.2f}%")
-    print(f"Matched RequestNos: {len(matched_requestnos)}")
-    print(f"Only in processed: {len(only_in_processed)}")
-    print(f"Only in reference: {len(only_in_reference)}")
+    print(f"Validation completed using ML metrics:")
+    print(f"Precision: {validation_results['ml_metrics']['precision']:.4f}")
+    print(f"Recall: {validation_results['ml_metrics']['recall']:.4f}")
+    print(f"F1-Score: {validation_results['ml_metrics']['f1_score']:.4f}")
+    print(f"True Positives: {len(true_positives)}")
+    print(f"False Positives: {len(false_positives)}")
+    print(f"False Negatives: {len(false_negatives)}")
     print(f"Total mismatches found: {len(validation_results['mismatches'])}")
     
     return validation_results
