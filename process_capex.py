@@ -419,18 +419,23 @@ def remove_aircon_fan_fireext_items(df):
     aircond_mask = combined.str.contains(aircond_regex, na=False)
     ac_standalone_mask = combined.str.contains(ac_word_regex, na=False) & combined.str.contains(ac_context_terms, na=False)
 
-    # CCTV should be excluded as well
-    cctv_regex = re.compile(r"\bcctv\b|camera", flags=re.IGNORECASE)
-    cctv_mask = combined.str.contains(cctv_regex, na=False)
+    # STOOL-Ops items should be excluded
+    stool_ops_regex = re.compile(r"stool\s*-\s*ops", flags=re.IGNORECASE)
+    stool_ops_mask = combined.str.contains(stool_ops_regex, na=False)
 
-    remove_mask = fire_mask | fan_mask | aircond_mask | ac_standalone_mask | cctv_mask
+    # CCTV should be excluded as well, but allow CCTV - BRANCH items
+    cctv_regex = re.compile(r"\bcctv\b|camera", flags=re.IGNORECASE)
+    cctv_branch_regex = re.compile(r"cctv\s*-\s*branch", flags=re.IGNORECASE)
+    cctv_mask = combined.str.contains(cctv_regex, na=False) & ~combined.str.contains(cctv_branch_regex, na=False)
+
+    remove_mask = fire_mask | fan_mask | aircond_mask | ac_standalone_mask | cctv_mask | stool_ops_mask
 
     before = df
     df = df[~remove_mask]
-    _record_exclusions(before, df, "3a: Excluded equipment (AirCon/Fan/FireExt/CCTV)", column_name='AssetItemName')
+    _record_exclusions(before, df, "3a: Excluded equipment (AirCon/Fan/FireExt/CCTV/STOOL-Ops)", column_name='AssetItemName')
 
     removed_count = initial_count - len(df)
-    print(f"Removed {removed_count} Air Conditioner/Fan/Fire Extinguisher items. Remaining: {len(df)} rows")
+    print(f"Removed {removed_count} Air Conditioner/Fan/Fire Extinguisher/CCTV/STOOL-Ops items. Remaining: {len(df)} rows")
     return df
 
 
@@ -805,7 +810,9 @@ def handle_office_and_furniture(df):
     return df
 
 def remove_ds_darkstore_counter(df):
-    """Remove rows where UserRemarks mention DS, dark store, or counter (case-insensitive, DS as word)."""
+    """Remove rows where UserRemarks mention DS, dark store, or counter (case-insensitive, DS as word).
+    Allow counter-related items that are legitimate operational items (Table, Electrical Work, Interior Work, etc.)
+    """
     print("Removing DS/dark store/counter remarks...")
     initial_count = len(df)
     if 'UserRemarks' in df.columns:
@@ -813,8 +820,20 @@ def remove_ds_darkstore_counter(df):
         flags_df = df['UserRemarks'].apply(remark_flags).apply(pd.Series)
         mask_ds = flags_df['mentions_ds_word']
         mask_dark = flags_df['mentions_dark_store']
+        
+        # For counter mentions, be more selective - exclude only if it's not a legitimate operational item
         mask_counter = flags_df['mentions_counter']
-        df = df[~(mask_ds | mask_dark | mask_counter)]
+        
+        # Define legitimate operational items that should be kept even if they mention counter
+        legitimate_items = ['table', 'electrical work', 'interior work', 'renovation', 'relocation', 'construction', 'installation']
+        
+        # Create a mask for legitimate items
+        legitimate_mask = df['AssetItemName'].str.contains('|'.join(legitimate_items), case=False, na=False)
+        
+        # Only exclude counter mentions if they're not legitimate operational items
+        mask_counter_filtered = mask_counter & ~legitimate_mask
+        
+        df = df[~(mask_ds | mask_dark | mask_counter_filtered)]
         _record_exclusions(before, df, "6/10: UserRemarks mention DS/dark store/counter", column_name='UserRemarks')
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows due to DS/dark store/counter remarks")
@@ -840,8 +859,7 @@ def remove_non_ops_equipment(df):
     # Define non-Ops equipment keywords (more specific to avoid removing legitimate items)
     non_ops_keywords = [
         'Personal', 'Individual', 'Non-operational', 'Administrative only',
-        'test', 'demo', 'sample',
-        'CCTV', 'Camera'
+        'test', 'demo', 'sample'
     ]
     
     # Remove rows with non-Ops equipment
@@ -852,6 +870,20 @@ def remove_non_ops_equipment(df):
                 df['UserRemarks'].str.contains(keyword, case=False, na=False))
         df = df[~mask]
         _record_exclusions(before, df, f"18: Non-Ops equipment keyword ('{keyword}')", column_name='AssetItemName')
+    
+    # Remove CCTV items but allow CCTV - BRANCH items
+    before = df
+    cctv_mask = (df['AssetItemName'].str.contains('CCTV', case=False, na=False) |
+                 df['ItemCategory'].str.contains('CCTV', case=False, na=False) |
+                 df['UserRemarks'].str.contains('CCTV', case=False, na=False))
+    # Allow CCTV - BRANCH items
+    cctv_branch_mask = (df['AssetItemName'].str.contains('CCTV.*BRANCH', case=False, na=False) |
+                       df['ItemCategory'].str.contains('CCTV.*BRANCH', case=False, na=False) |
+                       df['UserRemarks'].str.contains('CCTV.*BRANCH', case=False, na=False))
+    # Remove CCTV items that are not CCTV - BRANCH
+    final_cctv_mask = cctv_mask & ~cctv_branch_mask
+    df = df[~final_cctv_mask]
+    _record_exclusions(before, df, "18: Non-Ops equipment keyword ('CCTV')", column_name='AssetItemName')
     
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} non-Ops equipment items. Remaining: {len(df)} rows")
