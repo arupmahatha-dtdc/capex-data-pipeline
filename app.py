@@ -7,6 +7,58 @@ import base64
 import os
 from datetime import datetime
 
+# Robust CSV loading with encoding fallbacks
+def read_csv_with_fallback(source):
+    """Read CSV from a Streamlit UploadedFile or file path with encoding fallbacks.
+
+    Tries UTF-8, then UTF-8 with BOM, then Windows-1252, then Latin-1.
+    """
+    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+
+    # Uploaded file from Streamlit
+    try:
+        import streamlit.runtime.uploaded_file_manager  # type: ignore
+        is_streamlit_uploaded = hasattr(source, "getvalue") and callable(source.getvalue)
+    except Exception:
+        is_streamlit_uploaded = hasattr(source, "getvalue") and callable(source.getvalue)
+
+    if is_streamlit_uploaded:
+        data_bytes = source.getvalue()
+        last_error = None
+        for enc in encodings_to_try:
+            try:
+                return pd.read_csv(io.BytesIO(data_bytes), encoding=enc)
+            except Exception as e:
+                last_error = e
+                continue
+        # Last resort: replace invalid characters
+        try:
+            decoded = data_bytes.decode("utf-8", errors="replace")
+            return pd.read_csv(io.StringIO(decoded))
+        except Exception:
+            raise last_error if last_error else UnicodeDecodeError("utf-8", b"", 0, 1, "decode failed")
+
+    # Local file path
+    if isinstance(source, str):
+        last_error = None
+        for enc in encodings_to_try:
+            try:
+                return pd.read_csv(source, encoding=enc)
+            except Exception as e:
+                last_error = e
+                continue
+        # Last resort with replacement
+        try:
+            with open(source, "r", encoding="utf-8", errors="replace") as f:
+                return pd.read_csv(f)
+        except Exception:
+            if last_error:
+                raise last_error
+            raise
+
+    # Unsupported source type
+    raise ValueError("Unsupported CSV source type for read_csv_with_fallback")
+
 # Page configuration
 st.set_page_config(
     page_title="Capex Data Pipeline - Processing & Analysis",
@@ -74,7 +126,7 @@ def load_office_locations():
     """Load office locations from fixed file"""
     try:
         if os.path.exists('office_location.csv'):
-            return pd.read_csv('office_location.csv')
+            return read_csv_with_fallback('office_location.csv')
         else:
             st.error("Office location file (office_location.csv) not found. Please ensure the file exists in the project directory.")
             return None
@@ -141,8 +193,8 @@ def main():
     if process_button:
         if raw_data_file is not None:
             try:
-                # Load uploaded files
-                raw_data = pd.read_csv(raw_data_file)
+                # Load uploaded raw data with encoding fallbacks
+                raw_data = read_csv_with_fallback(raw_data_file)
                 st.session_state.raw_data = raw_data
                 
                 # Load office locations from fixed file
@@ -178,8 +230,8 @@ def main():
     if validate_button:
         if st.session_state.processed_data is not None and reference_data_file is not None:
             try:
-                # Load reference data
-                reference_data = pd.read_csv(reference_data_file)
+                # Load reference data with encoding fallbacks
+                reference_data = read_csv_with_fallback(reference_data_file)
                 st.session_state.reference_data = reference_data
                 
                 # Run comprehensive validation
