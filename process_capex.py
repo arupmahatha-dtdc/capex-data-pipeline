@@ -82,8 +82,19 @@ def _tokens(text: str) -> list:
     return re.findall(r"[a-zA-Z0-9']+", text.lower())
 
 def _contains_phrase(text_lower: str, phrase: str) -> list:
-    # Return list of match spans for a phrase (case-insensitive)
-    return [m.span() for m in re.finditer(re.escape(phrase.lower()), text_lower)]
+    """Return list of match spans for a phrase using whole-word boundaries where appropriate.
+    This prevents substring hits like 'trial' matching inside 'industrial'.
+    """
+    p = phrase.lower().strip()
+    if not p:
+        return []
+    # If phrase contains non-alphanumeric (space or hyphen), match phrase with word boundaries at ends
+    # Otherwise use \b for both sides to ensure whole-word match
+    if re.search(r"[^a-z0-9]", p):
+        pattern = re.compile(rf"\b{re.escape(p)}\b", flags=re.IGNORECASE)
+    else:
+        pattern = re.compile(rf"\b{re.escape(p)}\b", flags=re.IGNORECASE)
+    return [m.span() for m in pattern.finditer(text_lower)]
 
 def _is_negated(text_lower: str, span: tuple, window_words: int = 3) -> bool:
     # Check up to window_words before the match for negation words
@@ -423,10 +434,9 @@ def remove_aircon_fan_fireext_items(df):
     stool_ops_regex = re.compile(r"stool\s*-\s*ops", flags=re.IGNORECASE)
     stool_ops_mask = combined.str.contains(stool_ops_regex, na=False)
 
-    # CCTV should be excluded as well, but allow CCTV - BRANCH items
+    # CCTV should be excluded entirely (including variants like CCTV - BRANCH, CCTV-HUB, cameras)
     cctv_regex = re.compile(r"\bcctv\b|camera", flags=re.IGNORECASE)
-    cctv_branch_regex = re.compile(r"cctv\s*-\s*branch", flags=re.IGNORECASE)
-    cctv_mask = combined.str.contains(cctv_regex, na=False) & ~combined.str.contains(cctv_branch_regex, na=False)
+    cctv_mask = combined.str.contains(cctv_regex, na=False)
 
     remove_mask = fire_mask | fan_mask | aircond_mask | ac_standalone_mask | cctv_mask | stool_ops_mask
 
@@ -871,19 +881,15 @@ def remove_non_ops_equipment(df):
         df = df[~mask]
         _record_exclusions(before, df, f"18: Non-Ops equipment keyword ('{keyword}')", column_name='AssetItemName')
     
-    # Remove CCTV items but allow CCTV - BRANCH items
+    # Remove ALL CCTV items (no exceptions). Match across AssetItemName, ItemCategory, and UserRemarks.
     before = df
-    cctv_mask = (df['AssetItemName'].str.contains('CCTV', case=False, na=False) |
-                 df['ItemCategory'].str.contains('CCTV', case=False, na=False) |
-                 df['UserRemarks'].str.contains('CCTV', case=False, na=False))
-    # Allow CCTV - BRANCH items
-    cctv_branch_mask = (df['AssetItemName'].str.contains('CCTV.*BRANCH', case=False, na=False) |
-                       df['ItemCategory'].str.contains('CCTV.*BRANCH', case=False, na=False) |
-                       df['UserRemarks'].str.contains('CCTV.*BRANCH', case=False, na=False))
-    # Remove CCTV items that are not CCTV - BRANCH
-    final_cctv_mask = cctv_mask & ~cctv_branch_mask
-    df = df[~final_cctv_mask]
-    _record_exclusions(before, df, "18: Non-Ops equipment keyword ('CCTV')", column_name='AssetItemName')
+    cctv_mask = (
+        df['AssetItemName'].str.contains('CCTV|camera', case=False, na=False) |
+        df['ItemCategory'].str.contains('CCTV|camera', case=False, na=False) |
+        df['UserRemarks'].str.contains('CCTV|camera', case=False, na=False)
+    )
+    df = df[~cctv_mask]
+    _record_exclusions(before, df, "18: Non-Ops equipment keyword ('CCTV/camera')", column_name='AssetItemName')
     
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} non-Ops equipment items. Remaining: {len(df)} rows")
