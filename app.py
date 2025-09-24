@@ -437,7 +437,9 @@ def main():
                         # Table 1: False Positives (Only in Processed)
                         st.markdown("##### False Positives (Incorrectly Included)")
                         if not false_positives.empty:
-                            fp_display = false_positives[['RequestNo', 'AssetItemName', 'CompositeKey']].copy()
+                            # Prefer to show all components of the composite key
+                            cols_fp = [c for c in ['RequestNo', 'AssetItemName', 'VendorName', 'CompositeKey'] if c in false_positives.columns]
+                            fp_display = false_positives[cols_fp].copy()
                             st.dataframe(fp_display, use_container_width=True)
                             
                             # Download false positive mismatches
@@ -453,7 +455,7 @@ def main():
                         st.markdown("##### False Negatives (Incorrectly Excluded)")
                         if not false_negatives.empty:
                             # Include exclusion reason if available
-                            cols = ['RequestNo', 'AssetItemName', 'CompositeKey']
+                            cols = [c for c in ['RequestNo', 'AssetItemName', 'VendorName', 'CompositeKey'] if c in false_negatives.columns]
                             # Try to expand structured reason into columns if present
                             if 'exclusion_reason' in false_negatives.columns:
                                 # Normalize dict-like reasons to columns

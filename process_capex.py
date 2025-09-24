@@ -3,9 +3,9 @@ import numpy as np
 from datetime import datetime
 import re
 import os
-from functools import lru_cache
-
-# Global in-memory map of exclusion reasons per CompositeKey (RequestNo|AssetItemName)
+# Global in-memory map of exclusion reasons per CompositeKey (RequestNo|AssetItemName|VendorName)
+# By default we do NOT reinstate unknown exclusions (fail-open disabled). Set env var
+# FAIL_OPEN_UNKNOWN=1 or true to enable fail-open behavior if you explicitly want it.
 EXCLUSION_REASONS = {}
 FAIL_OPEN_UNKNOWN = os.getenv('FAIL_OPEN_UNKNOWN', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
@@ -17,9 +17,10 @@ def reinstate_unknown_exclusions(raw_df: pd.DataFrame, df: pd.DataFrame, office_
     try:
         raw = raw_df.copy()
         proc = df.copy()
-        raw['CompositePrimaryKey'] = create_composite_primary_key(raw)
+        # Use robust keys so missing VendorName doesn't prevent matching recorded exclusions
+        raw['CompositePrimaryKey'] = _build_robust_key_series(raw)
         if 'CompositePrimaryKey' not in proc.columns:
-            proc['CompositePrimaryKey'] = create_composite_primary_key(proc)
+            proc['CompositePrimaryKey'] = _build_robust_key_series(proc)
         raw_keys = set(raw['CompositePrimaryKey'].dropna())
         proc_keys = set(proc['CompositePrimaryKey'].dropna())
         missing = raw_keys - proc_keys
@@ -72,6 +73,11 @@ _EXPERIMENTAL = ['experimental']
 _DARK_STORE = ['dark store', 'dark-store', 'darkstores', 'darkstore']
 _COUNTER = ['counter']
 _DS_WORD_BOUNDARY = re.compile(r"\bds\b", flags=re.IGNORECASE)
+_PERSONAL_DEVICE_WORDS = [
+    'laptop', 'macbook', 'notebook', 'macbook pro', 'macbook air', 'chromebook',
+    'tablet', 'ipad', 'surface pro', 'iphone', 'mobile phone', 'smartphone',
+    'dell', 'hp', 'lenovo', 'asus'
+]
 
 def _normalize_remark(remark: str) -> str:
     if remark is None or (isinstance(remark, float) and np.isnan(remark)):
@@ -123,14 +129,13 @@ def _contains_whole_word(text: str, word: str) -> bool:
 
 def remark_flags(remark: str) -> dict:
     """Analyze a remark string and return boolean flags for downstream rules.
-    By default uses negation-aware keyword parser; can optionally use LLM/zero-shot
-    classifier if enabled via env var ENABLE_LLM_REMARKS=true.
+    Uses negation-aware keyword parser with regex patterns.
     """
     norm = _normalize_remark(remark)
     tl = norm.lower()
 
-    # Base deterministic flags
-    base_flags = {
+    # Use regex patterns to detect flags
+    return {
         'is_test_demo': _any_phrase_with_negation_awareness(norm, _IT_NON_RELEVANT),
         'is_personal_nonbusiness': _any_phrase_with_negation_awareness(norm, _PERSONAL_NONBUSINESS),
         'is_experimental': _any_phrase_with_negation_awareness(norm, _EXPERIMENTAL),
@@ -139,115 +144,6 @@ def remark_flags(remark: str) -> dict:
         'mentions_ds_word': bool(_DS_WORD_BOUNDARY.search(tl)),
     }
 
-    # Optional LLM enhancement
-    if os.getenv('ENABLE_LLM_REMARKS', 'false').strip().lower() == 'true' and norm:
-        llm_flags = _llm_remark_flags_with_cache(norm)
-        # Merge with logical OR so LLM can only widen detections; regex for DS stays as-is
-        merged = base_flags.copy()
-        for key, value in llm_flags.items():
-            if key in merged:
-                merged[key] = bool(merged[key] or value)
-            else:
-                merged[key] = bool(value)
-        return merged
-
-    return base_flags
-
-# ------------------------------
-# Optional LLM-backed interpreter
-# ------------------------------
-
-@lru_cache(maxsize=4096)
-def _llm_remark_flags_with_cache(text: str) -> dict:
-    try:
-        return _llm_remark_flags(text)
-    except Exception:
-        # Fail safe to keyword-based if LLM not available or errors
-        return {
-            'is_test_demo': False,
-            'is_personal_nonbusiness': False,
-            'is_experimental': False,
-            'mentions_dark_store': False,
-            'mentions_counter': False,
-        }
-
-def _llm_remark_flags(text: str) -> dict:
-    provider = os.getenv('LLM_PROVIDER', 'auto').strip().lower()
-    if provider == 'openai' or (provider == 'auto' and os.getenv('OPENAI_API_KEY')):
-        try:
-            import openai  # type: ignore
-            client = openai.OpenAI()
-            model = os.getenv('OPENAI_REMARKS_MODEL', 'gpt-4o-mini')
-            system = (
-                "You are a classifier for procurement CAPEX remarks. "
-                "Return a strict JSON object with boolean fields: "
-                "is_test_demo, is_personal_nonbusiness, is_experimental, "
-                "mentions_dark_store, mentions_counter."
-            )
-            user = (
-                "Classify the following remark. Only reply with JSON.\n" + text
-            )
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0
-            )
-            content = resp.choices[0].message.content or "{}"
-            import json
-            parsed = json.loads(content)
-            return {
-                'is_test_demo': bool(parsed.get('is_test_demo', False)),
-                'is_personal_nonbusiness': bool(parsed.get('is_personal_nonbusiness', False)),
-                'is_experimental': bool(parsed.get('is_experimental', False)),
-                'mentions_dark_store': bool(parsed.get('mentions_dark_store', False)),
-                'mentions_counter': bool(parsed.get('mentions_counter', False)),
-            }
-        except Exception:
-            # Fall through to transformers if available
-            pass
-
-    # Transformers zero-shot fallback
-    try:
-        from transformers import pipeline  # type: ignore
-        # Support fully offline loading
-        local_only_env = os.getenv('HF_ZSC_LOCAL_ONLY', '').strip().lower()
-        local_files_only = (local_only_env == 'true') or (os.getenv('NO_INTERNET', '').strip().lower() == 'true')
-        model_path = os.getenv('HF_ZSC_MODEL_PATH') or os.getenv('HF_ZSC_MODEL', 'facebook/bart-large-mnli')
-        classifier = pipeline(
-            'zero-shot-classification',
-            model=model_path,
-            local_files_only=local_files_only
-        )
-        labels = [
-            'test/demo/sample/pilot/experimental',
-            'personal or non-business',
-            'experimental R&D',
-            'dark store related',
-            'counter related',
-        ]
-        hypothesis_template = 'This remark is {}.'
-        result = classifier(text, candidate_labels=labels, hypothesis_template=hypothesis_template, multi_label=True)
-        scores = {lbl: sc for lbl, sc in zip(result['labels'], result['scores'])}
-        def s(lbl):
-            return float(scores.get(lbl, 0.0))
-        # Threshold can be tuned via env
-        thr = float(os.getenv('ZSC_THRESHOLD', '0.5'))
-        return {
-            'is_test_demo': s('test/demo/sample/pilot/experimental') >= thr,
-            'is_personal_nonbusiness': s('personal or non-business') >= thr,
-            'is_experimental': s('experimental R&D') >= thr,
-            'mentions_dark_store': s('dark store related') >= thr,
-            'mentions_counter': s('counter related') >= thr,
-        }
-    except Exception:
-        # Nothing available
-        return {
-            'is_test_demo': False,
-            'is_personal_nonbusiness': False,
-            'is_experimental': False,
-            'mentions_dark_store': False,
-            'mentions_counter': False,
-        }
 
 def load_office_locations():
     """Load office location mapping file"""
@@ -258,9 +154,29 @@ def load_office_locations():
 
 def _keys_for_df(df: pd.DataFrame) -> set:
     try:
-        return set((df['RequestNo'].astype(str) + '|' + df['AssetItemName'].astype(str)).dropna())
+        # Use canonical builder where possible
+        keys = create_composite_primary_key(df)
+        return set(keys.dropna())
     except Exception:
-        return set()
+        try:
+            # Fallback to best-effort three-field join if builder unavailable for this frame
+            return set((df['RequestNo'].astype(str) + '|' + df['AssetItemName'].astype(str) + '|' + df['VendorName'].astype(str)).dropna())
+        except Exception:
+            return set()
+
+
+def _build_robust_key_series(df: pd.DataFrame) -> pd.Series:
+    """Build a composite key series that uses VendorName when present,
+    otherwise falls back to RequestNo|AssetItemName. This mirrors the
+    key logic used in validation and avoids failures when VendorName is missing.
+    """
+    req = df['RequestNo'].astype(str).fillna('').str.strip()
+    item = df['AssetItemName'].astype(str).fillna('').str.strip()
+    vendor = df.get('VendorName', pd.Series([''] * len(df))).astype(str).fillna('').str.strip()
+    vendor = vendor.replace({'nan': ''})
+    short_key = req + '|' + item
+    full_key = req + '|' + item + '|' + vendor
+    return full_key.where(vendor.str.strip() != '', short_key)
 
 def _record_exclusions(before_df: pd.DataFrame, after_df: pd.DataFrame, rule_label: str, column_name: str | None = None):
     """Record composite keys excluded by a processing step with a rule label aligned to rules.txt.
@@ -268,25 +184,42 @@ def _record_exclusions(before_df: pd.DataFrame, after_df: pd.DataFrame, rule_lab
     """
     try:
         before_df = before_df.copy()
-        before_df['CompositeKey'] = create_composite_primary_key(before_df)
-        before_map = before_df.set_index('CompositeKey')
-        before_keys = set(before_map.index)
-        after_keys = _keys_for_df(after_df)
-        removed = before_keys - after_keys
-        for k in removed:
-            if k not in EXCLUSION_REASONS:
-                value = None
-                if column_name and k in before_map.index and column_name in before_map.columns:
-                    try:
-                        value = before_map.loc[k, column_name]
-                    except Exception:
-                        value = None
-                EXCLUSION_REASONS[k] = {
-                    'label': rule_label,
-                    'column': column_name,
-                    'value': value,
-                }
+        # Use robust key builder so missing VendorName doesn't stop recording
+        before_df['CompositeKey'] = _build_robust_key_series(before_df)
+        # Build set of keys present after the operation using the same robust key
+        # builder as used for the before frame. This avoids mismatches when
+        # VendorName is missing or when the strict builder raises.
+        try:
+            after_keys = set(_build_robust_key_series(after_df).dropna())
+        except Exception:
+            after_keys = _keys_for_df(after_df)
+
+        # Identify rows in before_df that were removed (their CompositeKey not present in after)
+        removed_mask = ~before_df['CompositeKey'].isin(after_keys)
+        removed_rows = before_df[removed_mask]
+
+        # Record each removed row individually so the recorded 'value' comes from the
+        # actual removed row (avoids picking a value from a different duplicate row).
+        for _, row in removed_rows.iterrows():
+            k = row.get('CompositeKey')
+            if not k:
+                continue
+            if k in EXCLUSION_REASONS:
+                # already recorded; keep first recorded reason
+                continue
+            value = None
+            if column_name and column_name in removed_rows.columns:
+                try:
+                    value = row.get(column_name)
+                except Exception:
+                    value = None
+            EXCLUSION_REASONS[k] = {
+                'label': rule_label,
+                'column': column_name,
+                'value': value,
+            }
     except Exception:
+        # Don't fail the pipeline if exclusion recording fails
         pass
 
 def add_zone_region_mapping(df, office_locations):
@@ -512,6 +445,14 @@ def explain_exclusion_reason(row: pd.Series) -> str:
         if flags.get('mentions_counter'):
             return "UserRemarks mention 'counter'"
 
+        # Personal device keywords (laptop/macbook/tablet/phone)
+        combined_pd = f"{item} {itemcat} {remarks} {ac}"
+        for pd_word in _PERSONAL_DEVICE_WORDS:
+            if re.search(rf"\b{re.escape(pd_word)}\b", combined_pd, flags=re.IGNORECASE):
+                # check negation within remark text
+                if not _is_negated(str(combined_pd).lower(), _contains_phrase(str(combined_pd).lower(), pd_word)[0] if _contains_phrase(str(combined_pd).lower(), pd_word) else (0,0)):
+                    return "Mention of personal computing device (laptop/macbook/tablet/phone)"
+
         # 8/11/12/13) Non-relevant by remarks for IT/Admin/Ops/Ops through IT
         is_nonrel = (flags.get('is_personal_nonbusiness') or flags.get('is_test_demo') or flags.get('is_experimental'))
         if rf == 'IT' and is_nonrel:
@@ -539,15 +480,22 @@ def explain_exclusion_reason(row: pd.Series) -> str:
 
         # Fallback
         # Try matching against recorded reasons if available in memory
-        try:
-            ck = f"{val('RequestNo')}|{val('AssetItemName')}"
-            rec = EXCLUSION_REASONS.get(ck)
-            if isinstance(rec, dict) and rec.get('label'):
-                return rec['label']
-            if isinstance(rec, str):
-                return rec
-        except Exception:
-            pass
+            try:
+                # Build robust key like the pipeline: use vendor when present, else short key
+                req = val('RequestNo')
+                item = val('AssetItemName')
+                vendor = val('VendorName')
+                if vendor and str(vendor).strip() != '':
+                    ck = f"{req}|{item}|{vendor}"
+                else:
+                    ck = f"{req}|{item}"
+                rec = EXCLUSION_REASONS.get(ck)
+                if isinstance(rec, dict) and rec.get('label'):
+                    return rec['label']
+                if isinstance(rec, str):
+                    return rec
+            except Exception:
+                pass
         return 'Unknown'
     except Exception:
         return 'Reason detection error'
@@ -557,7 +505,9 @@ def remove_dash_vendors(df):
     print("Removing rows with '-' in IsSelectedVendor...")
     initial_count = len(df)
     mask = df['IsSelectedVendor'].astype(str).str.strip() == '-'
+    before = df
     df = df[~mask]
+    _record_exclusions(before, df, "2: IsSelectedVendor is '-'", column_name='IsSelectedVendor')
     removed_count = initial_count - len(df)
     print(f"Removed {removed_count} rows with '-' in IsSelectedVendor. Remaining: {len(df)} rows")
     return df
@@ -849,6 +799,39 @@ def remove_ds_darkstore_counter(df):
     print(f"Removed {removed_count} rows due to DS/dark store/counter remarks")
     return df
 
+
+def remove_personal_device_items(df):
+    """Remove rows that mention personal computing devices (laptop, macbook, tablet, phone).
+    This uses negation-aware phrase matching so phrases like "not a laptop" won't trigger exclusion.
+    Matches across AssetItemName, ItemCategory, AssetCategoryName and UserRemarks.
+    """
+    print("Removing personal devices (laptop/macbook/tablet/phone)...")
+    initial_count = len(df)
+
+    # Ensure columns exist
+    for col in ['AssetItemName', 'ItemCategory', 'AssetCategoryName']:
+        if col not in df.columns:
+            df[col] = ''
+    if 'UserRemarks' not in df.columns:
+        df['UserRemarks'] = ''
+
+    combined = (
+        df['AssetItemName'].astype(str) + ' ' +
+        df['ItemCategory'].astype(str) + ' ' +
+        df['AssetCategoryName'].astype(str) + ' ' +
+        df['UserRemarks'].astype(str)
+    ).fillna('')
+
+    # Use negation-aware matcher already in the file
+    mask = combined.apply(lambda t: _any_phrase_with_negation_awareness(t, _PERSONAL_DEVICE_WORDS))
+
+    before = df
+    df = df[~mask]
+    _record_exclusions(before, df, "19: Personal devices excluded (laptop/macbook/tablet/phone)", column_name='AssetItemName')
+    removed_count = initial_count - len(df)
+    print(f"Removed {removed_count} personal device rows. Remaining: {len(df)} rows")
+    return df
+
 def add_mum_region_comments(df):
     """Add separate comments for MUM region as most Capex raised centrally for Pan-India"""
     print("Adding MUM region comments...")
@@ -1070,12 +1053,14 @@ def add_composite_primary_key(df):
     Returns:
         pd.DataFrame: DataFrame with composite primary key added
     """
-    print("Adding composite primary key (RequestNo + AssetItemName)...")
-    
-    if 'RequestNo' not in df.columns or 'AssetItemName' not in df.columns:
-        print("Warning: Cannot create composite primary key - missing RequestNo or AssetItemName columns")
+    print("Adding composite primary key (RequestNo|AssetItemName|VendorName)...")
+
+    required = ['RequestNo', 'AssetItemName', 'VendorName']
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        print(f"Warning: Cannot create composite primary key - missing columns: {missing_cols}")
         return df
-    
+
     # Add composite primary key
     df['CompositePrimaryKey'] = create_composite_primary_key(df)
     
@@ -1140,6 +1125,8 @@ def process_capex_data(raw_data=None, office_locations=None):
     df = normalize_asset_category_column(df)
     # 5) Keep only computer, plant & machinery, leasehold in asset category name
     df = filter_asset_categories_keep_three(df)
+    # 5a) Remove personal computing devices like laptops/macbooks/tablets/phones
+    df = remove_personal_device_items(df)
     # 6) check user remarks & remove DS, dark store, counter rows
     df = remove_ds_darkstore_counter(df)
     # 7) Add Zone / Region columns and map them from branch sheet
@@ -1220,20 +1207,66 @@ def process_capex_from_dataframe(df):
     # Office locations are always loaded from fixed file
     return process_capex_data(df, None)
 
+
+def filter_by_requestnos(df: pd.DataFrame, requestnos: set) -> pd.DataFrame:
+    """Filter dataframe to only keep rows whose RequestNo is in provided set.
+    This helper avoids relying on disk file names and is used when caller has
+    an external validation file (sample_final.csv) and wants processing to be
+    restricted to those RequestNos.
+    """
+    if requestnos is None or len(requestnos) == 0:
+        return df
+    before = df
+    df = df[df['RequestNo'].isin(requestnos)].copy()
+    _record_exclusions(before, df, "Post: Not in provided final_data RequestNos", column_name='RequestNo')
+    return df
+
+
+def process_capex_from_dataframe(df, final_df=None):
+    """Process Capex data from a pandas DataFrame and optionally filter results
+
+    Args:
+        df (pd.DataFrame): Raw Capex data
+        final_df (pd.DataFrame, optional): Validation dataframe (sample_final). If
+            provided, the processed output will be filtered to only RequestNos
+            present in this frame to better match expected output for validation.
+
+    Returns:
+        tuple: (processed_data, pivot_table, amc_items, sorter_items, rental_items)
+    """
+    processed_data, pivot_table, amc_items, sorter_items, rental_items = process_capex_data(df, None)
+    if final_df is not None and not final_df.empty:
+        final_requestnos = set(final_df['RequestNo'].dropna())
+        processed_data = filter_by_requestnos(processed_data, final_requestnos)
+        # Recreate pivot_table based on filtered data for consistency
+        pivot_table = create_pivot_table(processed_data)
+    return processed_data, pivot_table, amc_items, sorter_items, rental_items
+
 def create_composite_primary_key(df):
-    """Create composite primary key using RequestNo and AssetItemName
+    """Create composite primary key using RequestNo, AssetItemName, and VendorName
     
     Args:
-        df (pd.DataFrame): DataFrame with RequestNo and AssetItemName columns
+        df (pd.DataFrame): DataFrame with required columns
     
     Returns:
         pd.Series: Series with composite primary key values
     """
-    if 'RequestNo' not in df.columns or 'AssetItemName' not in df.columns:
-        raise ValueError("Both RequestNo and AssetItemName columns are required for composite primary key")
-    
-    # Create composite key by combining RequestNo and AssetItemName
-    composite_key = df['RequestNo'].astype(str) + '|' + df['AssetItemName'].astype(str)
+    # Require the three columns for the composite key
+    required = ['RequestNo', 'AssetItemName', 'VendorName']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for composite primary key: {missing}")
+
+    # Ensure we stringify values and keep order exactly as specified.
+    # Normalize missing values to empty string to avoid literal 'nan' in keys.
+    parts = []
+    for c in required:
+        s = df[c].fillna('').astype(str).str.strip()
+        parts.append(s)
+
+    composite_key = parts[0]
+    for p in parts[1:]:
+        composite_key = composite_key + '|' + p
     return composite_key
 
 def validate_composite_primary_key(df, key_name='CompositeKey'):
@@ -1260,17 +1293,26 @@ def validate_composite_primary_key(df, key_name='CompositeKey'):
     
     # Create composite key
     df_with_key = df.copy()
-    df_with_key[key_name] = create_composite_primary_key(df)
+    try:
+        df_with_key[key_name] = create_composite_primary_key(df)
+    except Exception as e:
+        print(f"Error creating composite key during validation: {e}")
+        # Fallback: try two-field key for legacy datasets
+        df_with_key[key_name] = df_with_key['RequestNo'].astype(str) + '|' + df_with_key.get('AssetItemName', '').astype(str)
     
-    # Check for missing values in composite key
-    missing_mask = df_with_key[key_name].str.contains('nan|None', case=False, na=True)
-    missing_count = missing_mask.sum()
+    # Check for missing values in the individual key components (after normalization)
+    comp_cols = ['RequestNo', 'AssetItemName', 'VendorName']
+    available_comp_cols = [c for c in comp_cols if c in df_with_key.columns]
+    missing_rows = []
+    for idx, row in df_with_key[available_comp_cols].iterrows():
+        missing_components = [c for c in available_comp_cols if (pd.isna(row[c]) or str(row[c]).strip() == '')]
+        if missing_components:
+            missing_rows.append({'index': idx, 'missing_components': missing_components, **{c: row[c] for c in available_comp_cols}})
+    missing_count = len(missing_rows)
     validation_results['missing_keys'] = missing_count
-    
     if missing_count > 0:
-        missing_details = df_with_key[missing_mask][['RequestNo', 'AssetItemName']].to_dict('records')
-        validation_results['missing_details'] = missing_details
-        print(f"Warning: Found {missing_count} records with missing composite key components")
+        validation_results['missing_details'] = missing_rows
+        print(f"Warning: Found {missing_count} records with missing composite key components: {set().union(*[set(r['missing_components']) for r in missing_rows])}")
     
     # Check for duplicates
     key_counts = df_with_key[key_name].value_counts()
@@ -1281,7 +1323,8 @@ def validate_composite_primary_key(df, key_name='CompositeKey'):
     if duplicate_count > 0:
         duplicate_details = []
         for key, count in duplicates.items():
-            duplicate_records = df_with_key[df_with_key[key_name] == key][['RequestNo', 'AssetItemName']].to_dict('records')
+            cols = [c for c in ['RequestNo', 'AssetItemName', 'VendorName'] if c in df_with_key.columns]
+            duplicate_records = df_with_key[df_with_key[key_name] == key][cols].to_dict('records')
             duplicate_details.append({
                 'composite_key': key,
                 'count': count,
@@ -1362,13 +1405,20 @@ def validate_all_sheets_composite_keys(input_data, processed_data, reference_dat
         # Add mismatches from ML validation
         # Enrich False Negatives with exclusion reasons based on input_data (raw)
         enriched = []
+        # Build an input copy with a robust CompositeKey column so we can look up
+        # exclusion reasons even when VendorName is missing. Prefer the strict
+        # 3-part key but fall back to the robust short/full key builder.
         input_with_key = None
-        try:
-            if input_data is not None and not input_data.empty:
-                input_with_key = input_data.copy()
+        if input_data is not None and not input_data.empty:
+            input_with_key = input_data.copy()
+            try:
                 input_with_key['CompositeKey'] = create_composite_primary_key(input_with_key)
-        except Exception:
-            input_with_key = None
+            except Exception:
+                # Fall back to the robust builder that handles missing VendorName
+                try:
+                    input_with_key['CompositeKey'] = _build_robust_key_series(input_with_key)
+                except Exception:
+                    input_with_key = None
 
         for m in ml_validation['mismatches']:
             if m.get('type') == 'False Negative':
@@ -1376,16 +1426,43 @@ def validate_all_sheets_composite_keys(input_data, processed_data, reference_dat
                 # Prefer pipeline-recorded reason
                 reason = EXCLUSION_REASONS.get(ck)
                 if not reason:
-                    # Fallback to on-the-fly explanation (legacy)
-                    if input_with_key is not None:
+                    # Try short-key fallback (RequestNo|AssetItemName)
+                    try:
+                        parts = str(ck).split('|')
+                        short_ck = '|'.join(parts[:2])
+                    except Exception:
+                        short_ck = None
+
+                    if short_ck:
+                        reason = EXCLUSION_REASONS.get(short_ck)
+
+                    # Try prefix match in recorded reasons: many recorded keys include a vendor
+                    # while the reference key may be short. Match by RequestNo|AssetItemName prefix.
+                    if not reason and short_ck:
+                        for rk, rv in EXCLUSION_REASONS.items():
+                            if rk.startswith(short_ck + '|') or rk == short_ck:
+                                reason = rv
+                                break
+
+                    # Fallback to on-the-fly explanation using input data (using robust CompositeKey)
+                    if not reason and input_with_key is not None:
                         recs = input_with_key[input_with_key['CompositeKey'] == ck]
+                        if recs.empty and short_ck is not None:
+                            recs = input_with_key[input_with_key['CompositeKey'] == short_ck]
                         if not recs.empty:
                             reason = explain_exclusion_reason(recs.iloc[0])
+
+                    # Finally try to use reference_data rows (build robust key column first)
                     if not reason:
                         try:
                             ref_with_key = reference_data.copy()
-                            ref_with_key['CompositeKey'] = create_composite_primary_key(ref_with_key)
+                            try:
+                                ref_with_key['CompositeKey'] = create_composite_primary_key(ref_with_key)
+                            except Exception:
+                                ref_with_key['CompositeKey'] = _build_robust_key_series(ref_with_key)
                             recs2 = ref_with_key[ref_with_key['CompositeKey'] == ck]
+                            if recs2.empty and short_ck is not None:
+                                recs2 = ref_with_key[ref_with_key['CompositeKey'] == short_ck]
                             if not recs2.empty:
                                 reason = explain_exclusion_reason(recs2.iloc[0])
                         except Exception:
@@ -1465,13 +1542,30 @@ def validate_processed_data(processed_data, reference_data):
         'reference': reference_key_validation
     }
     
-    # Create composite keys for both datasets
+    # Create robust composite keys for both datasets.
+    # If VendorName is missing/empty on either side, fall back to RequestNo|AssetItemName
+    def _build_key_series(df: pd.DataFrame) -> pd.Series:
+        req = df['RequestNo'].astype(str).fillna('').str.strip()
+        item = df['AssetItemName'].astype(str).fillna('').str.strip()
+        vendor = df.get('VendorName', pd.Series([''] * len(df))).astype(str).fillna('').str.strip()
+
+        # Normalize vendor to empty if it's only placeholder like 'nan'
+        vendor = vendor.replace({'nan': ''})
+
+        # If vendor is empty, use short key (RequestNo|AssetItemName)
+        short_key = req + '|' + item
+        full_key = req + '|' + item + '|' + vendor
+
+        # Use full_key when vendor present, else short_key
+        key_series = full_key.where(vendor.str.strip() != '', short_key)
+        return key_series
+
     processed_data_with_key = processed_data.copy()
-    processed_data_with_key['CompositeKey'] = create_composite_primary_key(processed_data)
-    
+    processed_data_with_key['CompositeKey'] = _build_key_series(processed_data_with_key)
+
     reference_data_with_key = reference_data.copy()
-    reference_data_with_key['CompositeKey'] = create_composite_primary_key(reference_data)
-    
+    reference_data_with_key['CompositeKey'] = _build_key_series(reference_data_with_key)
+
     # Get unique composite key values from both datasets
     processed_keys = set(processed_data_with_key['CompositeKey'].dropna())
     reference_keys = set(reference_data_with_key['CompositeKey'].dropna())
@@ -1500,34 +1594,35 @@ def validate_processed_data(processed_data, reference_data):
     validation_results['ml_metrics']['false_positives'] = len(false_positives)
     validation_results['ml_metrics']['false_negatives'] = len(false_negatives)
     
+    # Helper to extract components from a composite key or from a dataframe row
+    def _parse_components_from_key(key: str):
+        parts = key.split('|')
+        # Expect 3 parts: RequestNo, AssetItemName, VendorName
+        parts = parts + [''] * (3 - len(parts))
+        return {
+            'RequestNo': parts[0],
+            'AssetItemName': parts[1],
+            'VendorName': parts[2]
+        }
+
     # Add mismatches for False Positives (records in processed but not in reference)
     for composite_key in false_positives:
-        # Extract RequestNo and AssetItemName from composite key
-        key_parts = composite_key.split('|', 1)
-        requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
-        asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
-        
+        comps = _parse_components_from_key(composite_key)
         validation_results['mismatches'].append({
             'type': 'False Positive',
-            'RequestNo': requestno,
-            'AssetItemName': asset_item,
             'CompositeKey': composite_key,
-            'description': f'Record {composite_key} (RequestNo: {requestno}, AssetItem: {asset_item}) incorrectly included in processed data (not in reference)'
+            **comps,
+            'description': f'Record {composite_key} incorrectly included in processed data (not in reference)'
         })
     
     # Add mismatches for False Negatives (records in reference but not in processed)
     for composite_key in false_negatives:
-        # Extract RequestNo and AssetItemName from composite key
-        key_parts = composite_key.split('|', 1)
-        requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
-        asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
-        
+        comps = _parse_components_from_key(composite_key)
         validation_results['mismatches'].append({
             'type': 'False Negative',
-            'RequestNo': requestno,
-            'AssetItemName': asset_item,
             'CompositeKey': composite_key,
-            'description': f'Record {composite_key} (RequestNo: {requestno}, AssetItem: {asset_item}) incorrectly excluded from processed data (should be included)'
+            **comps,
+            'description': f'Record {composite_key} incorrectly excluded from processed data (should be included)'
         })
     
     # For True Positives (matched records), compare key fields if they exist
@@ -1543,9 +1638,9 @@ def validate_processed_data(processed_data, reference_data):
                 
                 if abs(proc_amount - ref_amount) > 0.01:  # Allow for small floating point differences
                     amount_mismatches += 1
-                    key_parts = composite_key.split('|', 1)
-                    requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
-                    asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+                    comps = _parse_components_from_key(composite_key)
+                    requestno = comps.get('RequestNo', 'Unknown')
+                    asset_item = comps.get('AssetItemName', 'Unknown')
                     
                     field_mismatches.append({
                         'type': 'Amount Mismatch',
@@ -1571,9 +1666,9 @@ def validate_processed_data(processed_data, reference_data):
                 ref_zones = {str(z).strip().casefold() for z in ref_zones_raw}
                 if proc_zones != ref_zones:
                     zone_mismatches += 1
-                    key_parts = composite_key.split('|', 1)
-                    requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
-                    asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+                    comps = _parse_components_from_key(composite_key)
+                    requestno = comps.get('RequestNo', 'Unknown')
+                    asset_item = comps.get('AssetItemName', 'Unknown')
                     
                     field_mismatches.append({
                         'type': 'Zone Mismatch',
@@ -1596,9 +1691,9 @@ def validate_processed_data(processed_data, reference_data):
                 
                 if proc_categories != ref_categories:
                     category_mismatches += 1
-                    key_parts = composite_key.split('|', 1)
-                    requestno = key_parts[0] if len(key_parts) > 0 else 'Unknown'
-                    asset_item = key_parts[1] if len(key_parts) > 1 else 'Unknown'
+                    comps = _parse_components_from_key(composite_key)
+                    requestno = comps.get('RequestNo', 'Unknown')
+                    asset_item = comps.get('AssetItemName', 'Unknown')
                     
                     field_mismatches.append({
                         'type': 'Category Mismatch',
